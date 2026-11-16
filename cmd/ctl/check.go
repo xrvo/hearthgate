@@ -32,6 +32,13 @@ func (r *reporter) fail(format string, args ...any) {
 	fmt.Fprintf(r.app.out, "  FAIL  %s\n", fmt.Sprintf(format, args...))
 }
 
+// detail prints the explanation of a failure, indented under it.
+func (r *reporter) detail(err error) {
+	for _, l := range strings.Split(err.Error(), "\n") {
+		fmt.Fprintf(r.app.out, "        %s\n", l)
+	}
+}
+
 func (r *reporter) skip(format string, args ...any) {
 	fmt.Fprintf(r.app.out, "  skip  %s\n", fmt.Sprintf(format, args...))
 }
@@ -128,7 +135,8 @@ func (a *app) checkEdge(ctx context.Context, r *reporter, cfg *config.Config) {
 
 	out, err := c.Compose(ctx, `exec -T tunnel sh -c "wg show wg0 latest-handshakes; echo now; date +%s"`)
 	if err != nil {
-		r.fail("could not query the edge tunnel: %v", err)
+		r.fail("could not query the edge tunnel")
+		r.detail(err)
 		return
 	}
 	if age, err := handshakeAge(string(out)); err != nil {
@@ -153,7 +161,8 @@ func (a *app) checkEdge(ctx context.Context, r *reporter, cfg *config.Config) {
 	probe := fmt.Sprintf(`exec -T tunnel sh -c 'for p in %s; do if nc -z -w 3 %s $p >/dev/null 2>&1; then echo "$p open"; else echo "$p closed"; fi; done'`, list, cfg.HomeIP)
 	out, err = c.Compose(ctx, probe)
 	if err != nil {
-		r.fail("could not probe the home gateway from the edge: %v", err)
+		r.fail("could not probe the home gateway from the edge")
+		r.detail(err)
 		return
 	}
 	results := parseProbe(string(out))

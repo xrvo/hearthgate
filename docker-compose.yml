@@ -18,8 +18,6 @@ services:
       HEARTHGATE_CONFIG_HASH: "${HEARTHGATE_CONFIG_HASH:-}"
     sysctls:
       net.ipv4.ip_forward: "0"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
       - ./generated/home/wireguard:/config
     networks:
@@ -71,19 +69,14 @@ services:
     image: ghcr.io/xrvo/hearthgate:0.1.0
     working_dir: /work
     network_mode: bridge
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     environment:
       SSH_AUTH_SOCK: /ssh-agent
+      # Lets error messages name the key folder mounted below.
+      HEARTHGATE_SSH_DIR_HOST: "${HEARTHGATE_SSH_DIR:-${HOME:-.}/.ssh}"
     volumes:
       - .:/work
       # Used by `push` and `check` to reach the edge. Keys are read, never written.
-      - type: bind
-        source: "${HEARTHGATE_SSH_DIR:-${HOME:-.}/.ssh}"
-        target: /ssh
-        read_only: true
-        bind:
-          create_host_path: false
+      - "${HEARTHGATE_SSH_DIR:-${HOME:-.}/.ssh}:/ssh:ro"
       - "${SSH_AUTH_SOCK:-/dev/null}:/ssh-agent"
 
 networks:

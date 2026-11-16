@@ -1,8 +1,11 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -163,6 +166,77 @@ func TestErrors(t *testing.T) {
 	bad := project(t, "edge: {address: ''}\npublish: {}\n")
 	if code, out := ctl(t, bad, "", "init"); code == 0 || !strings.Contains(out, "edge.address is required") {
 		t.Errorf("init with invalid config: code %d\n%s", code, out)
+	}
+}
+
+func TestBundle(t *testing.T) {
+	dir := project(t, testConfig)
+	if code, out := ctl(t, dir, "", "bundle"); code == 0 || !strings.Contains(out, "ctl init") {
+		t.Errorf("bundle before init: code %d\n%s", code, out)
+	}
+	if code, out := ctl(t, dir, "", "init"); code != 0 {
+		t.Fatalf("init failed:\n%s", out)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"bundle", "-dir", dir}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("bundle failed:\n%s", stderr.String())
+	}
+	gz, err := gzip.NewReader(&stdout)
+	if err != nil {
+		t.Fatalf("bundle output is not gzip: %v", err)
+	}
+	got := map[string]string{}
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(tr)
+		got[hdr.Name] = string(body)
+	}
+	for _, f := range []string{"docker-compose.yml", "nginx.conf", "wireguard/firewall.sh", "wireguard/wg_confs/wg0.conf"} {
+		if got[f] != read(t, dir, "generated/edge/"+f) {
+			t.Errorf("bundle entry %s differs from generated/edge/%s", f, f)
+		}
+	}
+	if len(got) != 4 {
+		t.Errorf("bundle has %d entries, want 4", len(got))
+	}
+
+	// A stale bundle must not be handed out.
+	os.WriteFile(filepath.Join(dir, "hearthgate.yml"), []byte(strings.Replace(testConfig, "45876", "45877", 1)), 0o644)
+	if code, out := ctl(t, dir, "", "bundle"); code == 0 || !strings.Contains(out, "ctl apply") {
+		t.Errorf("bundle with pending changes: code %d\n%s", code, out)
+	}
+}
+
+func TestBundleRefusesTerminal(t *testing.T) {
+	tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0)
+	if err != nil {
+		if tty, err = os.OpenFile("/dev/null", os.O_WRONLY, 0); err != nil {
+			t.Skip("no character device to stand in for a terminal")
+		}
+	}
+	defer tty.Close()
+	if !isTerminal(tty) {
+		t.Error("a character device is not seen as a terminal")
+	}
+	if isTerminal(&bytes.Buffer{}) {
+		t.Error("a buffer is seen as a terminal")
+	}
+}
+
+func TestManualInstallCommand(t *testing.T) {
+	dir := project(t, strings.Replace(testConfig, "address: 203.0.113.5", "address: 203.0.113.5\n  ssh_port: 2222", 1))
+	_, out := ctl(t, dir, "", "push")
+	want := "docker compose run --rm -T ctl bundle | ssh -p 2222 <user>@203.0.113.5 'mkdir -p hearthgate && cd hearthgate && tar -xzf - && "
+	if !strings.Contains(out, want) || strings.Count(out, "'") != 2 {
+		t.Errorf("manual install command is wrong or not safely quoted:\n%s", out)
 	}
 }
 

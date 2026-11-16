@@ -1,0 +1,7 @@
+# Test only. The end-to-end test runs both stacks on one Docker host, so the
+# home gateway reaches "the VPS" through the host. Compose merges this file
+# into docker-compose.yml when both are in the test's work directory.
+services:
+  gateway:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

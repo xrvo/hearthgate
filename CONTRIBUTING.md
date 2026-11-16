@@ -14,6 +14,7 @@ Issues and pull requests are welcome. For anything that affects the trust bounda
 | `docker-compose.yml` | The home stack, and the `ctl` service; users download it from the release |
 | `.github/workflows/release.yml` | On a `v*.*.*` tag, publishes the `ctl` image to `ghcr.io/xrvo/hearthgate` and creates the GitHub release |
 | `tests/e2e/run.sh` | Runs both stacks on one Docker host and probes them |
+| `tests/e2e/docker-compose.override.yml` | Settings the home stack needs only inside that test |
 
 ## Running the tests
 

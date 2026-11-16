@@ -83,19 +83,20 @@ Certificates are issued automatically the first time each hostname is requested.
 
 `ctl push` signs in with your SSH agent, or with `id_ed25519`, `id_ecdsa` or `id_rsa` from `~/.ssh`. It does not read `~/.ssh/config`. If your keys live elsewhere, set `HEARTHGATE_SSH_DIR` to that directory.
 
-### Installing the edge by hand
+If it cannot connect, `ctl` says why (no key found, key not authorised on the VPS, wrong port, changed host key, Docker missing on the VPS) and lists what to try. The first time it connects it shows the VPS's host key fingerprint and remembers the key in `generated/known_hosts`.
 
-If you leave out `edge.ssh`, or `push` doesn't suit your setup, copy the bundle yourself:
+If you have no `~/.ssh` folder yet, Docker creates an empty one owned by root when `ctl` first runs. Take it back with `sudo chown "$(id -u):$(id -g)" ~/.ssh` before you make a key in it.
+
+### Installing the edge with your own ssh
+
+If you leave out `edge.ssh`, or your connection needs `~/.ssh/config`, a jump host or a password, pipe the bundle through your own `ssh`:
 
 ```sh
-scp -r generated/edge ubuntu@203.0.113.5:hearthgate
-ssh ubuntu@203.0.113.5
-cd hearthgate
-printf 'HEARTHGATE_PUID=%s\nHEARTHGATE_PGID=%s\n' "$(id -u)" "$(id -g)" > .env
-docker compose up -d
+docker compose run --rm -T ctl bundle | ssh ubuntu@203.0.113.5 \
+  'mkdir -p hearthgate && cd hearthgate && tar -xzf - && printf "HEARTHGATE_PUID=%s\nHEARTHGATE_PGID=%s\n" "$(id -u)" "$(id -g)" > .env && docker compose up -d --remove-orphans'
 ```
 
-Repeat this whenever `ctl apply` says the edge bundle changed.
+`ctl` prints this command, filled in for your configuration, whenever the edge needs installing by hand. Repeat it whenever `ctl apply` says the edge bundle changed. The `-T` matters: without it the archive would pass through a terminal and arrive corrupted, so `ctl bundle` stops and tells you.
 
 ## Connecting your containers
 
@@ -207,6 +208,7 @@ Run each as `docker compose run --rm ctl <command>`.
 |---|---|
 | `init` | Generates keys and renders the home and edge stacks |
 | `push` | Copies the edge bundle over SSH and starts it |
+| `bundle` | Writes the edge bundle to standard output as a `tar.gz`, for installing with your own `ssh` |
 | `apply` | Re-renders after a config change, previews the diff, and pushes the edge if it changed |
 | `check` | Tests the certificates, the tunnel handshake, and that home ports other than 443 are closed to the edge |
 | `rotate` | Replaces the WireGuard keys on both sides |

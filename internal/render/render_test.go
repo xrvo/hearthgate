@@ -263,6 +263,21 @@ func TestHomeComposeUsesPinnedImages(t *testing.T) {
 }
 
 // The example file is what `ctl init` hands new users, so it must always be valid.
+// Compose resolves mounts before ctl starts, so a mount that fails when the
+// user has no ~/.ssh would abort every command, including `init`. Settings
+// that only the end-to-end test needs belong in its override file.
+func TestHomeComposeHasNoInstallTraps(t *testing.T) {
+	data, err := os.ReadFile("../../docker-compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"create_host_path: false", "host.docker.internal"} {
+		if strings.Contains(string(data), bad) {
+			t.Errorf("docker-compose.yml contains %q", bad)
+		}
+	}
+}
+
 func TestExampleConfigIsValid(t *testing.T) {
 	c, err := config.Parse(ExampleConfig)
 	if err != nil {

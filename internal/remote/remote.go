@@ -11,8 +11,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/xrvo/hearthgate/internal/render"
@@ -25,9 +25,14 @@ type Client struct {
 	Dir        string    // remote directory, already validated
 	KnownHosts string    // known_hosts file kept with the generated state
 	KeyDir     string    // directory holding the user's SSH keys, may not exist
-	Stderr     io.Writer // receives ssh's own output (prompts, errors)
+	KeyDirName string    // what to call KeyDir in messages; in the container, the host's path
+	AgentSock  string    // SSH agent socket, may be empty or not a socket
+	Owner      int       // uid that owns the project directory, 0 if unknown
+	Stderr     io.Writer // receives ssh's own output and notices about the connection
 
-	tmp string
+	tmp    string
+	auth   *authState
+	loaded bool
 }
 
 // Close removes temporary key copies.
@@ -45,44 +50,18 @@ func (c *Client) args() ([]string, error) {
 		"-o", "UserKnownHostsFile=" + c.KnownHosts,
 		"-o", "ConnectTimeout=15",
 	}
-	keys, err := c.identities()
+	auth, err := c.identities()
 	if err != nil {
 		return nil, err
 	}
-	for _, k := range keys {
-		args = append(args, "-i", k)
+	for _, k := range auth.keys {
+		args = append(args, "-i", k.path)
 	}
 	return append(args, c.Target), nil
 }
 
-// identities copies the usual private keys out of KeyDir with strict
-// permissions. A read-only mount of ~/.ssh can present modes or owners that
-// ssh refuses to use directly.
-func (c *Client) identities() ([]string, error) {
-	if c.KeyDir == "" {
-		return nil, nil
-	}
-	var out []string
-	for _, name := range []string{"id_ed25519", "id_ecdsa", "id_rsa"} {
-		data, err := os.ReadFile(filepath.Join(c.KeyDir, name))
-		if err != nil {
-			continue
-		}
-		if c.tmp == "" {
-			if c.tmp, err = os.MkdirTemp("", "hearthgate-ssh-"); err != nil {
-				return nil, err
-			}
-		}
-		dst := filepath.Join(c.tmp, name)
-		if err := os.WriteFile(dst, data, 0o600); err != nil {
-			return nil, err
-		}
-		out = append(out, dst)
-	}
-	return out, nil
-}
-
 // Run executes a shell script on the edge and returns its standard output.
+// When it fails, the error says what went wrong and what to try.
 func (c *Client) Run(ctx context.Context, script string, stdin io.Reader) ([]byte, error) {
 	if _, err := exec.LookPath("ssh"); err != nil {
 		return nil, errors.New("no ssh client found; run ctl from its container image, or install the edge bundle by hand")
@@ -91,15 +70,81 @@ func (c *Client) Run(ctx context.Context, script string, stdin io.Reader) ([]byt
 	if err != nil {
 		return nil, err
 	}
+	known, _ := os.ReadFile(c.KnownHosts)
+
 	cmd := exec.CommandContext(ctx, "ssh", append(args, script)...)
+	cmd.Env = c.env()
 	cmd.Stdin = stdin
-	cmd.Stderr = c.Stderr
-	var out bytes.Buffer
+	var out, errBuf bytes.Buffer
 	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		return out.Bytes(), fmt.Errorf("ssh %s: %w", c.Target, err)
+	shown := &lineFilter{w: c.Stderr, drop: "Warning: Permanently added"}
+	cmd.Stderr = io.MultiWriter(shown, &errBuf)
+	runErr := cmd.Run()
+	shown.Flush()
+	c.announceHostKeys(known)
+
+	if runErr == nil {
+		return out.Bytes(), nil
 	}
-	return out.Bytes(), nil
+	if ctx.Err() != nil {
+		return out.Bytes(), ctx.Err()
+	}
+	code := -1
+	var exit *exec.ExitError
+	if errors.As(runErr, &exit) {
+		code = exit.ExitCode()
+	}
+	if msg := c.explain(classify(code, errBuf.String()+out.String())); msg != "" {
+		return out.Bytes(), errors.New(msg)
+	}
+	return out.Bytes(), fmt.Errorf("ssh %s: %w", c.Target, runErr)
+}
+
+// env is the environment for ssh. A missing agent is mounted as /dev/null in
+// the container; pointing ssh at that only adds noise to its errors.
+func (c *Client) env() []string {
+	var env []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "SSH_AUTH_SOCK=") {
+			env = append(env, kv)
+		}
+	}
+	if isSocket(c.AgentSock) {
+		env = append(env, "SSH_AUTH_SOCK="+c.AgentSock)
+	}
+	return env
+}
+
+// announceHostKeys reports host keys that this run added to KnownHosts.
+// They are accepted on first use, so the user should at least see them.
+func (c *Client) announceHostKeys(before []byte) {
+	after, err := os.ReadFile(c.KnownHosts)
+	if err != nil || bytes.Equal(before, after) {
+		return
+	}
+	old := map[string]bool{}
+	for _, l := range strings.Split(string(before), "\n") {
+		old[l] = true
+	}
+	for _, l := range strings.Split(string(after), "\n") {
+		if old[l] {
+			continue
+		}
+		if kind, fp, ok := fingerprint(l); ok {
+			fmt.Fprintf(c.Stderr, "First connection to %s: saved its %s host key in %s.\n  Fingerprint: %s\n  To verify, compare with `ssh-keygen -lf /etc/ssh/ssh_host_%s_key.pub` run on the VPS.\n",
+				c.host(), strings.ToUpper(kind), c.KnownHosts, fp, kind)
+		}
+	}
+}
+
+func (c *Client) host() string {
+	_, host, _ := strings.Cut(c.Target, "@")
+	return host
+}
+
+func (c *Client) user() string {
+	user, _, _ := strings.Cut(c.Target, "@")
+	return user
 }
 
 // Push installs the edge bundle and starts or updates the edge stack.
@@ -110,19 +155,21 @@ func (c *Client) Push(ctx context.Context, bundle render.Files) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
-	script := fmt.Sprintf(`set -eu
-mkdir -p '%[1]s'
-cd '%[1]s'
-tar -xzf -
-printf 'HEARTHGATE_PUID=%%s\nHEARTHGATE_PGID=%%s\n' "$(id -u)" "$(id -g)" > .env
-docker compose up -d --remove-orphans 2>&1`, c.Dir)
+	script := "set -eu\n" + InstallScript(c.Dir) + " 2>&1"
 	return c.Run(ctx, script, bytes.NewReader(archive))
+}
+
+// InstallScript is the shell command that installs a bundle archive read from
+// standard input into dir and starts the edge stack. dir must be validated.
+// It contains no single quotes, so it can be passed to ssh inside a pair.
+func InstallScript(dir string) string {
+	return fmt.Sprintf(`mkdir -p %[1]s && cd %[1]s && tar -xzf - && printf "HEARTHGATE_PUID=%%s\nHEARTHGATE_PGID=%%s\n" "$(id -u)" "$(id -g)" > .env && docker compose up -d --remove-orphans`, dir)
 }
 
 // Compose runs `docker compose <args>` in the edge directory. Arguments must
 // be trusted: they are passed to the remote shell as written.
 func (c *Client) Compose(ctx context.Context, args string) ([]byte, error) {
-	return c.Run(ctx, fmt.Sprintf("cd '%s' && docker compose %s", c.Dir, args), nil)
+	return c.Run(ctx, fmt.Sprintf("cd %s && docker compose %s", c.Dir, args), nil)
 }
 
 // Archive packs the bundle as a gzipped tarball.

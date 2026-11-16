@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/xrvo/hearthgate/internal/config"
 	"github.com/xrvo/hearthgate/internal/diff"
@@ -36,6 +37,7 @@ Commands:
            edited, generate keys and render both stacks
   apply    Re-render after editing hearthgate.yml, preview the diff, update the edge
   push     Copy the edge bundle to the VPS over SSH and start it
+  bundle   Write the edge bundle to standard output, to install it with your own ssh
   check    Verify the tunnel, certificates and firewall
   rotate   Replace the WireGuard keys on both sides
   version  Print the version
@@ -86,6 +88,8 @@ func run(ctx context.Context, args []string, in io.Reader, out, errw io.Writer) 
 		cmd = func(ctx context.Context) error { return a.cmdApply(ctx, yes, noPush) }
 	case "push":
 		cmd = a.cmdPush
+	case "bundle":
+		cmd = a.cmdBundle
 	case "check":
 		cmd = a.cmdCheck
 	case "rotate":
@@ -238,16 +242,22 @@ func (a *app) confirm(question string) bool {
 }
 
 func (a *app) client(cfg *config.Config) *remote.Client {
+	// In the container the keys are mounted at /ssh, and compose passes the
+	// folder's real path so messages can name it.
 	keyDir := os.Getenv("HEARTHGATE_SSH_DIR")
 	if keyDir == "" {
 		keyDir = "/ssh"
 	}
+	owner, _, _ := dirOwner(a.dir)
 	return &remote.Client{
 		Target:     cfg.SSH,
 		Port:       cfg.SSHPort,
 		Dir:        cfg.EdgeDir,
 		KnownHosts: filepath.Join(a.dir, "generated", "known_hosts"),
 		KeyDir:     keyDir,
+		KeyDirName: os.Getenv("HEARTHGATE_SSH_DIR_HOST"),
+		AgentSock:  os.Getenv("SSH_AUTH_SOCK"),
+		Owner:      owner,
 		Stderr:     a.errw,
 	}
 }
@@ -259,17 +269,27 @@ func (a *app) push(ctx context.Context, cfg *config.Config, files render.Files) 
 	out, err := c.Push(ctx, files.WithPrefix(render.EdgeDir))
 	a.out.Write(out)
 	if err != nil {
-		return fmt.Errorf("%w\nThe bundle is in generated/edge if you prefer to install it by hand (see README)", err)
+		return fmt.Errorf("the edge was not updated.\n\n%w\n\nTo install the edge with your own ssh setup instead (it may use ~/.ssh/config, jump hosts or a password):\n  %s", err, bundleCommand(cfg))
 	}
 	fmt.Fprintln(a.out, "Edge updated.")
 	return nil
 }
 
+// bundleCommand is the one-line manual install: it pipes the bundle through
+// the user's own ssh client on the home server.
+func bundleCommand(cfg *config.Config) string {
+	target := cfg.SSH
+	if target == "" {
+		target = "<user>@" + cfg.EdgeAddress
+	}
+	if cfg.SSHPort != config.DefaultSSHPort {
+		target = fmt.Sprintf("-p %d %s", cfg.SSHPort, target)
+	}
+	return fmt.Sprintf("docker compose run --rm -T ctl bundle | ssh %s '%s'", target, remote.InstallScript(cfg.EdgeDir))
+}
+
 func (a *app) manualEdgeHint(cfg *config.Config) {
-	fmt.Fprintf(a.out, `The edge bundle changed. Install it on the VPS:
-  1. copy generated/edge/ to the VPS as ~/%s
-  2. there, run:  printf 'HEARTHGATE_PUID=%%s\nHEARTHGATE_PGID=%%s\n' "$(id -u)" "$(id -g)" > .env && docker compose up -d
-`, cfg.EdgeDir)
+	fmt.Fprintf(a.out, "The edge bundle changed. Install it on the VPS:\n  %s\n", bundleCommand(cfg))
 }
 
 // scaffold is the first run in a new project directory: it writes a config
@@ -317,7 +337,7 @@ func (a *app) cmdInit(ctx context.Context) error {
 	if cfg.SSH != "" {
 		fmt.Fprintln(a.out, "  docker compose run --rm ctl push    # install and start the edge")
 	} else {
-		fmt.Fprintf(a.out, "  copy generated/edge/ to the VPS as ~/%s and start it (see README, \"Installing the edge by hand\")\n", cfg.EdgeDir)
+		fmt.Fprintf(a.out, "  install and start the edge with your own ssh:\n    %s\n", bundleCommand(cfg))
 	}
 	fmt.Fprintln(a.out, "  docker compose up -d                # start the home gateway")
 	return nil
@@ -423,4 +443,48 @@ func (a *app) cmdPush(ctx context.Context) error {
 		return errors.New("generated files do not match hearthgate.yml; run `ctl apply` first")
 	}
 	return a.push(ctx, cfg, files)
+}
+
+// cmdBundle writes the edge bundle as a gzipped tarball to standard output.
+// Everything else it has to say goes to standard error.
+func (a *app) cmdBundle(ctx context.Context) error {
+	cfg, err := a.loadConfig()
+	if err != nil {
+		return err
+	}
+	st, err := state.Load(a.statePath())
+	if err != nil {
+		return err
+	}
+	files, err := a.renderAll(cfg, st)
+	if err != nil {
+		return err
+	}
+	changes, err := a.pending(files)
+	if err != nil {
+		return err
+	}
+	if len(changes) > 0 {
+		return errors.New("generated files do not match hearthgate.yml; run `ctl apply` first")
+	}
+	if isTerminal(a.out) {
+		return fmt.Errorf("the bundle is a binary archive, and a terminal would corrupt it.\nPipe it to the VPS (note the -T):\n  %s", bundleCommand(cfg))
+	}
+	archive, err := remote.Archive(files.WithPrefix(render.EdgeDir), time.Now())
+	if err != nil {
+		return err
+	}
+	_, err = a.out.Write(archive)
+	return err
+}
+
+// isTerminal reports whether w is a terminal. `docker compose run` gives the
+// container one unless it is passed -T.
+func isTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
