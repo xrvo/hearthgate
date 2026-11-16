@@ -65,6 +65,7 @@ refuse() { local d=$1; shift; if "$@" >/dev/null 2>&1; then fail "$d"; else pass
 echo "== Building ctl and rendering the configuration"
 teardown
 mkdir -p "$WORK"
+cp "$ROOT/docker-compose.yml" "$WORK/"
 cat > "$WORK/hearthgate.yml" <<EOF
 edge:
   address: host.docker.internal

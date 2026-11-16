@@ -2,6 +2,7 @@ package render
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 
@@ -242,16 +243,22 @@ func TestHashesTrackContent(t *testing.T) {
 	}
 }
 
-func TestHomeCompose(t *testing.T) {
-	f, err := HomeCompose("1.2.3")
+// The home stack's compose file is static, so its image pins can drift from
+// the ones rendered into the edge bundle unless something checks. Users copy
+// the file on its own, so it must also run without a source checkout.
+func TestHomeComposeUsesPinnedImages(t *testing.T) {
+	data, err := os.ReadFile("../../docker-compose.yml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantAll(t, "home compose", string(f.Content),
-		"image: "+ImageWireGuard+"\n", "image: "+ImageNginx+"\n", "image: "+ImageCaddy+"\n",
-		"image: ghcr.io/xrvo/hearthgate:1.2.3\n", "name: hearthgate-dmz", "name: hearthgate-mgmt")
-	if strings.Contains(string(f.Content), "build:") {
-		t.Error("home compose needs a source checkout to build ctl")
+	compose := string(data)
+	for _, img := range []string{ImageWireGuard, ImageNginx, ImageCaddy} {
+		if !strings.Contains(compose, "image: "+img+"\n") {
+			t.Errorf("docker-compose.yml does not use %s", img)
+		}
+	}
+	if strings.Contains(compose, "build:") {
+		t.Error("docker-compose.yml needs a source checkout to build ctl")
 	}
 }
 

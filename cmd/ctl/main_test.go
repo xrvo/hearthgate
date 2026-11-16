@@ -52,7 +52,7 @@ func TestInitThenApply(t *testing.T) {
 		t.Fatalf("init failed:\n%s", out)
 	}
 	for _, f := range []string{
-		"generated/state.json", ".env", "docker-compose.yml",
+		"generated/state.json", ".env",
 		"generated/home/Caddyfile", "generated/home/nginx.conf",
 		"generated/home/wireguard/wg_confs/wg0.conf", "generated/home/wireguard/firewall.sh",
 		"generated/edge/docker-compose.yml", "generated/edge/nginx.conf",
@@ -94,14 +94,11 @@ func TestInitThenApply(t *testing.T) {
 	}
 }
 
-func TestInitInEmptyDirectory(t *testing.T) {
+func TestInitWritesStartingConfig(t *testing.T) {
 	dir := t.TempDir()
 	code, out := ctl(t, dir, "", "init")
-	if code != 0 || !strings.Contains(out, "docker compose run --rm ctl init") {
+	if code != 0 || !strings.Contains(out, "edit hearthgate.yml") {
 		t.Fatalf("first init: code %d\n%s", code, out)
-	}
-	if !strings.Contains(read(t, dir, "docker-compose.yml"), "image: ghcr.io/xrvo/hearthgate:"+version+"\n") {
-		t.Error("compose file does not run the ctl image of this version")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "generated")); err == nil {
 		t.Error("first init generated keys before the config was edited")
@@ -113,19 +110,6 @@ func TestInitInEmptyDirectory(t *testing.T) {
 	}
 	if code, out := ctl(t, dir, "", "apply"); code != 0 || !strings.Contains(out, "Nothing to change") {
 		t.Errorf("apply after init: code %d\n%s", code, out)
-	}
-}
-
-func TestInitKeepsForeignComposeFile(t *testing.T) {
-	foreign := "services: {db: {image: postgres}}\n"
-	for _, dir := range []string{t.TempDir(), project(t, testConfig)} {
-		os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(foreign), 0o644)
-		if code, out := ctl(t, dir, "", "init"); code == 0 || !strings.Contains(out, "not written by Hearthgate") {
-			t.Errorf("init over a foreign compose file: code %d\n%s", code, out)
-		}
-		if read(t, dir, "docker-compose.yml") != foreign {
-			t.Error("init replaced a compose file it did not write")
-		}
 	}
 }
 

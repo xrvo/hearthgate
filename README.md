@@ -50,10 +50,11 @@ On your **home server**:
 
 ```sh
 mkdir hearthgate && cd hearthgate
-docker run --rm -v "$PWD:/work" ghcr.io/xrvo/hearthgate init
+wget https://github.com/xrvo/hearthgate/releases/latest/download/docker-compose.yml
+docker compose run --rm ctl init    # writes a starting hearthgate.yml
 ```
 
-This writes two files: a starting `hearthgate.yml` and the `docker-compose.yml` that every later command runs through. There is nothing to clone or build.
+You can also copy [`docker-compose.yml`](docker-compose.yml) from the repository by hand. There is nothing to clone or build: the compose file pulls the published `ghcr.io/xrvo/hearthgate` image.
 
 Edit `hearthgate.yml`:
 
@@ -214,15 +215,13 @@ Run each as `docker compose run --rm ctl <command>`.
 
 ## Upgrading
 
-Releases are published as `ghcr.io/xrvo/hearthgate:<version>` for `amd64` and `arm64`. `docker-compose.yml` names the release that wrote it, so to upgrade, run the new release's `apply` once:
+Releases are published as `ghcr.io/xrvo/hearthgate:<version>` for `amd64` and `arm64`, and each release's `docker-compose.yml` names that version. To upgrade, replace the compose file and re-apply:
 
 ```sh
-docker run --rm -v "$PWD:/work" ghcr.io/xrvo/hearthgate:<version> apply -no-push
-docker compose run --rm ctl push    # only if apply says the edge bundle changed
+wget -O docker-compose.yml https://github.com/xrvo/hearthgate/releases/latest/download/docker-compose.yml
+docker compose run --rm ctl apply   # shows what the new release changes, then updates the edge
 docker compose up -d
 ```
-
-`apply` shows what the new release changes, such as updated image pins, before it writes anything.
 
 ## How it works
 
@@ -235,7 +234,7 @@ Each side runs a WireGuard container with proxies sharing its network namespace.
 - **Keys:** both WireGuard key pairs are generated at home. The edge's key reaches it inside the pushed bundle.
 - **Images:** stock upstream images ([linuxserver/wireguard](https://github.com/linuxserver/docker-wireguard), Caddy, nginx) pinned by digest. The only custom code is `ctl`, a small Go program that runs one-shot and never listens on the network.
 
-Everything `ctl` writes is in `generated/`, `.env` and `docker-compose.yml`. Keep `generated/state.json` private and backed up: it holds the tunnel keys.
+Everything `ctl` writes is in `generated/` and `.env`, plus the starting `hearthgate.yml`. Keep `generated/state.json` private and backed up: it holds the tunnel keys.
 
 ## Security model
 
@@ -309,11 +308,10 @@ bash tests/e2e/run.sh   # both stacks on one Docker host; needs WireGuard in the
 
 The end-to-end test checks the paths that must work and, more importantly, the ones that must not. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-To run a stack from a checkout, build the image under the name the compose file expects for a development build:
+To run a stack with your own build of `ctl`, give the image the name `docker-compose.yml` uses, so Compose finds it locally and does not pull the release:
 
 ```sh
-docker build -t ghcr.io/xrvo/hearthgate:dev .
-docker run --rm -v "$PWD:/work" ghcr.io/xrvo/hearthgate:dev init   # in an empty directory
+docker build -t "$(sed -n 's/.*image: \(ghcr.io\/xrvo\/hearthgate:.*\)/\1/p' docker-compose.yml)" .
 ```
 
 ## License

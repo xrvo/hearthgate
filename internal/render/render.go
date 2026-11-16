@@ -20,27 +20,23 @@ import (
 	"github.com/xrvo/hearthgate/internal/state"
 )
 
-// Images used by both stacks, pinned by tag and digest.
+// Images used by both stacks, pinned by tag and digest. The home stack's
+// docker-compose.yml must use the same references; a test enforces that.
 const (
 	ImageWireGuard = "linuxserver/wireguard:1.0.20260223-r0-ls130@sha256:10db56ad834f94541307d5dfdbe87370e26d155bb341a5bf65789f970f24ab5c"
 	ImageNginx     = "nginx:1.30.6-alpine@sha256:901e593c95dc85f5a729f5765516321366ef4ac401821431d408897e95287d0a"
 	ImageCaddy     = "caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0"
 )
 
-// CtlImageRepo is where releases of the ctl image are published. The home
-// stack's ctl service runs the tag matching the ctl that rendered it.
-const CtlImageRepo = "ghcr.io/xrvo/hearthgate"
-
 // Paths of the rendered files, relative to the project directory.
 const (
-	HomeDir     = "generated/home/"
-	EdgeDir     = "generated/edge/"
-	EnvFile     = ".env"
-	ComposeFile = "docker-compose.yml"
+	HomeDir = "generated/home/"
+	EdgeDir = "generated/edge/"
+	EnvFile = ".env"
 )
 
-// ExampleConfig is the starting hearthgate.yml that `ctl init` writes into an
-// empty project directory.
+// ExampleConfig is the starting hearthgate.yml that `ctl init` writes when
+// the project directory has none.
 //
 //go:embed templates/hearthgate.example.yml
 var ExampleConfig []byte
@@ -160,23 +156,6 @@ func Render(cfg *config.Config, st *state.State) (Files, error) {
 	files[EnvFile] = File{Content: []byte(env), Mode: 0o644}
 
 	return files, nil
-}
-
-// HomeCompose renders the home stack's compose file. It depends on no
-// configuration: the settings that vary are read from the rendered .env.
-// version is the ctl release whose image the stack's ctl service runs.
-func HomeCompose(version string) (File, error) {
-	var buf bytes.Buffer
-	err := templates.ExecuteTemplate(&buf, "home-compose.yml.tmpl", map[string]string{
-		"ImageWireGuard": ImageWireGuard,
-		"ImageNginx":     ImageNginx,
-		"ImageCaddy":     ImageCaddy,
-		"ImageCtl":       CtlImageRepo + ":" + version,
-	})
-	if err != nil {
-		return File{}, fmt.Errorf("render %s: %w", ComposeFile, err)
-	}
-	return File{Content: buf.Bytes(), Mode: 0o644}, nil
 }
 
 func hash(files Files) string {

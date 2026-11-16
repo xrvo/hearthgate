@@ -1,7 +1,8 @@
 name: Release
 
 # Pushing a tag like v0.1.0 publishes ghcr.io/<owner>/hearthgate:0.1.0, :0.1
-# and :latest. Pre-release tags (v0.2.0-rc.1) publish only their own version.
+# and :latest, then creates a GitHub release with docker-compose.yml attached.
+# Pre-release tags (v0.2.0-rc.1) publish only their own version.
 on:
   push:
     tags: ["v*.*.*"]
@@ -13,8 +14,22 @@ jobs:
   test:
     uses: ./.github/workflows/ci.yml
 
+  # Users download docker-compose.yml from the release, so it must run the
+  # image this release publishes. Bump the tag in it before tagging.
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker-compose.yml names this release
+        run: |
+          want="image: ghcr.io/$GITHUB_REPOSITORY:${GITHUB_REF_NAME#v}"
+          grep -qxF "    $want" docker-compose.yml || {
+            echo "::error file=docker-compose.yml::expected the ctl service to use '$want'"
+            exit 1
+          }
+
   image:
-    needs: test
+    needs: [test, compose]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -45,11 +60,24 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # ctl writes this version into the compose file it generates, so it
-          # must be the image tag (0.1.0), not the git tag (v0.1.0).
+          # `ctl version` prints the image tag (0.1.0), not the git tag (v0.1.0).
           build-args: VERSION=${{ steps.meta.outputs.version }}
       - uses: actions/attest-build-provenance@v2
         with:
           subject-name: ghcr.io/${{ github.repository }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+
+  release:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$GITHUB_REF_NAME" in *-*) pre=--prerelease ;; *) pre= ;; esac
+          gh release create "$GITHUB_REF_NAME" docker-compose.yml --verify-tag --generate-notes $pre
