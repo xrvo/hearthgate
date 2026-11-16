@@ -1,0 +1,462 @@
+// Command ctl generates and deploys Hearthgate's configuration.
+//
+// It runs one-shot on the home server, normally through
+// `docker compose run --rm ctl <command>`, and never listens on the network.
+// The first `init` in an empty directory writes that compose file.
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+
+	"github.com/xrvo/hearthgate/internal/config"
+	"github.com/xrvo/hearthgate/internal/diff"
+	"github.com/xrvo/hearthgate/internal/remote"
+	"github.com/xrvo/hearthgate/internal/render"
+	"github.com/xrvo/hearthgate/internal/state"
+)
+
+var version = "dev"
+
+const usage = `Hearthgate ctl: generate and deploy the tunnel configuration.
+
+Usage: ctl <command> [flags]
+
+Commands:
+  init     In an empty directory, write a starting hearthgate.yml and
+           docker-compose.yml; once hearthgate.yml is edited, generate keys
+           and render both stacks
+  apply    Re-render after editing hearthgate.yml, preview the diff, update the edge
+  push     Copy the edge bundle to the VPS over SSH and start it
+  check    Verify the tunnel, certificates and firewall
+  rotate   Replace the WireGuard keys on both sides
+  version  Print the version
+
+Common flags:
+  -dir string      project directory (default ".")
+  -config string   config file (default "<dir>/hearthgate.yml")
+
+Run "ctl <command> -h" for the flags of one command.
+`
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	os.Exit(run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+}
+
+type app struct {
+	dir     string
+	cfgPath string
+	in      *bufio.Reader
+	out     io.Writer
+	errw    io.Writer
+}
+
+func run(ctx context.Context, args []string, in io.Reader, out, errw io.Writer) int {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
+		fmt.Fprint(out, usage)
+		return 0
+	}
+	a := &app{in: bufio.NewReader(in), out: out, errw: errw}
+	name, rest := args[0], args[1:]
+
+	fs := flag.NewFlagSet("ctl "+name, flag.ContinueOnError)
+	fs.SetOutput(errw)
+	fs.StringVar(&a.dir, "dir", ".", "project directory")
+	fs.StringVar(&a.cfgPath, "config", "", "config file (default <dir>/hearthgate.yml)")
+	yes := false
+	noPush := false
+
+	var cmd func(context.Context) error
+	switch name {
+	case "init":
+		cmd = a.cmdInit
+	case "apply":
+		fs.BoolVar(&yes, "yes", false, "apply without asking")
+		fs.BoolVar(&noPush, "no-push", false, "do not update the edge over SSH")
+		cmd = func(ctx context.Context) error { return a.cmdApply(ctx, yes, noPush) }
+	case "push":
+		cmd = a.cmdPush
+	case "check":
+		cmd = a.cmdCheck
+	case "rotate":
+		fs.BoolVar(&yes, "yes", false, "rotate without asking")
+		fs.BoolVar(&noPush, "no-push", false, "do not update the edge over SSH")
+		cmd = func(ctx context.Context) error { return a.cmdRotate(ctx, yes, noPush) }
+	case "version":
+		fmt.Fprintln(out, version)
+		return 0
+	default:
+		fmt.Fprintf(errw, "unknown command %q\n\n%s", name, usage)
+		return 2
+	}
+	if err := fs.Parse(rest); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(errw, "unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+	if a.cfgPath == "" {
+		a.cfgPath = filepath.Join(a.dir, "hearthgate.yml")
+	}
+
+	if err := cmd(ctx); err != nil {
+		if !errors.Is(err, errReported) {
+			fmt.Fprintf(errw, "error: %v\n", err)
+		}
+		return 1
+	}
+	return 0
+}
+
+// errReported marks a failure whose details were already printed.
+var errReported = errors.New("failed")
+
+func (a *app) statePath() string { return filepath.Join(a.dir, "generated", "state.json") }
+
+func (a *app) loadConfig() (*config.Config, error) {
+	data, err := os.ReadFile(a.cfgPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("%s not found: run `ctl init` to create one, then edit it", a.cfgPath)
+	}
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := config.Parse(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s:\n%w", a.cfgPath, err)
+	}
+	return cfg, nil
+}
+
+// renderAll renders every file and adds the settings that depend on where ctl
+// is running: the gateway runs as the project directory's owner, so generated
+// files stay owned by that user.
+func (a *app) renderAll(cfg *config.Config, st *state.State) (render.Files, error) {
+	files, err := render.Render(cfg, st)
+	if err != nil {
+		return nil, err
+	}
+	if uid, gid, ok := dirOwner(a.dir); ok && uid != 0 {
+		env := files[render.EnvFile]
+		env.Content = append(env.Content, fmt.Appendf(nil, "HEARTHGATE_PUID=%d\nHEARTHGATE_PGID=%d\n", uid, gid)...)
+		files[render.EnvFile] = env
+	}
+	compose, err := render.HomeCompose(version)
+	if err != nil {
+		return nil, err
+	}
+	files[render.ComposeFile] = compose
+	return files, nil
+}
+
+type change struct {
+	path  string
+	lines []string
+}
+
+// pending compares rendered files with what is on disk. Secrets are redacted
+// before comparing, so the result is safe to print.
+func (a *app) pending(files render.Files) ([]change, error) {
+	var out []change
+	for _, p := range files.Paths() {
+		old, err := os.ReadFile(filepath.Join(a.dir, filepath.FromSlash(p)))
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
+		if bytes.Equal(old, files[p].Content) {
+			continue
+		}
+		lines := diff.Lines(diff.Redact(string(old)), diff.Redact(string(files[p].Content)))
+		out = append(out, change{path: p, lines: lines})
+	}
+	return out, nil
+}
+
+func touches(changes []change, prefix string) bool {
+	for _, c := range changes {
+		if strings.HasPrefix(c.path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *app) printChanges(changes []change) {
+	for _, c := range changes {
+		fmt.Fprintf(a.out, "\n%s\n", c.path)
+		for _, l := range c.lines {
+			fmt.Fprintf(a.out, "  %s\n", l)
+		}
+	}
+	fmt.Fprintln(a.out)
+}
+
+// write stores changed files only, in place, so the bind mounts of running
+// containers keep pointing at the same files.
+func (a *app) write(files render.Files) error {
+	uid, gid, owned := dirOwner(a.dir)
+	for _, p := range files.Paths() {
+		f := files[p]
+		full := filepath.Join(a.dir, filepath.FromSlash(p))
+		if old, err := os.ReadFile(full); err == nil && bytes.Equal(old, f.Content) {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(full, f.Content, f.Mode); err != nil {
+			return err
+		}
+		if err := os.Chmod(full, f.Mode); err != nil {
+			return err
+		}
+	}
+	if owned && uid != 0 && os.Geteuid() == 0 {
+		chownTree(filepath.Join(a.dir, "generated"), uid, gid)
+		os.Chown(filepath.Join(a.dir, render.EnvFile), uid, gid)
+		os.Chown(filepath.Join(a.dir, render.ComposeFile), uid, gid)
+	}
+	return nil
+}
+
+func (a *app) confirm(question string) bool {
+	fmt.Fprintf(a.out, "%s [y/N] ", question)
+	line, _ := a.in.ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true
+	}
+	return false
+}
+
+func (a *app) client(cfg *config.Config) *remote.Client {
+	keyDir := os.Getenv("HEARTHGATE_SSH_DIR")
+	if keyDir == "" {
+		keyDir = "/ssh"
+	}
+	return &remote.Client{
+		Target:     cfg.SSH,
+		Port:       cfg.SSHPort,
+		Dir:        cfg.EdgeDir,
+		KnownHosts: filepath.Join(a.dir, "generated", "known_hosts"),
+		KeyDir:     keyDir,
+		Stderr:     a.errw,
+	}
+}
+
+func (a *app) push(ctx context.Context, cfg *config.Config, files render.Files) error {
+	fmt.Fprintf(a.out, "Pushing the edge bundle to %s:%s ...\n", cfg.SSH, cfg.EdgeDir)
+	c := a.client(cfg)
+	defer c.Close()
+	out, err := c.Push(ctx, files.WithPrefix(render.EdgeDir))
+	a.out.Write(out)
+	if err != nil {
+		return fmt.Errorf("%w\nThe bundle is in generated/edge if you prefer to install it by hand (see README)", err)
+	}
+	fmt.Fprintln(a.out, "Edge updated.")
+	return nil
+}
+
+func (a *app) manualEdgeHint(cfg *config.Config) {
+	fmt.Fprintf(a.out, `The edge bundle changed. Install it on the VPS:
+  1. copy generated/edge/ to the VPS as ~/%s
+  2. there, run:  printf 'HEARTHGATE_PUID=%%s\nHEARTHGATE_PGID=%%s\n' "$(id -u)" "$(id -g)" > .env && docker compose up -d
+`, cfg.EdgeDir)
+}
+
+// composeMarker starts every compose file ctl writes.
+const composeMarker = "# Generated by Hearthgate."
+
+// checkCompose refuses to replace a compose file that belongs to something
+// else, which is what running init in the wrong directory would do.
+func (a *app) checkCompose() error {
+	path := filepath.Join(a.dir, render.ComposeFile)
+	old, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) || (err == nil && bytes.HasPrefix(old, []byte(composeMarker))) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("%s exists and was not written by Hearthgate.\nRun ctl in a directory of its own", path)
+}
+
+// scaffold is the first run in an empty directory: it writes a config to edit
+// and the compose file that later commands run through.
+func (a *app) scaffold() error {
+	compose, err := render.HomeCompose(version)
+	if err != nil {
+		return err
+	}
+	composePath := filepath.Join(a.dir, render.ComposeFile)
+	if err := os.WriteFile(composePath, compose.Content, compose.Mode); err != nil {
+		return err
+	}
+	if err := os.WriteFile(a.cfgPath, render.ExampleConfig, 0o644); err != nil {
+		return err
+	}
+	if uid, gid, ok := dirOwner(a.dir); ok && uid != 0 && os.Geteuid() == 0 {
+		os.Chown(composePath, uid, gid)
+		os.Chown(a.cfgPath, uid, gid)
+	}
+	fmt.Fprintf(a.out, "Wrote %s and %s.\n\nNext:\n", filepath.Base(a.cfgPath), render.ComposeFile)
+	fmt.Fprintf(a.out, "  edit %s\n", filepath.Base(a.cfgPath))
+	fmt.Fprintln(a.out, "  docker compose run --rm ctl init    # generate keys, render both stacks")
+	return nil
+}
+
+func (a *app) cmdInit(ctx context.Context) error {
+	if err := a.checkCompose(); err != nil {
+		return err
+	}
+	if _, err := os.Stat(a.cfgPath); errors.Is(err, fs.ErrNotExist) {
+		return a.scaffold()
+	}
+	cfg, err := a.loadConfig()
+	if err != nil {
+		return err
+	}
+	if state.Exists(a.statePath()) {
+		return fmt.Errorf("already initialised (%s exists).\nUse `ctl apply` after changing hearthgate.yml, or `ctl rotate` to replace the keys", a.statePath())
+	}
+	st, err := state.New()
+	if err != nil {
+		return err
+	}
+	files, err := a.renderAll(cfg, st)
+	if err != nil {
+		return err
+	}
+	if err := st.Save(a.statePath()); err != nil {
+		return err
+	}
+	if err := a.write(files); err != nil {
+		return err
+	}
+	fmt.Fprintf(a.out, "Generated keys and %d files under generated/.\n\nNext:\n", len(files))
+	if cfg.SSH != "" {
+		fmt.Fprintln(a.out, "  docker compose run --rm ctl push    # install and start the edge")
+	} else {
+		fmt.Fprintf(a.out, "  copy generated/edge/ to the VPS as ~/%s and start it (see README, \"Installing the edge by hand\")\n", cfg.EdgeDir)
+	}
+	fmt.Fprintln(a.out, "  docker compose up -d                # start the home gateway")
+	return nil
+}
+
+func (a *app) cmdApply(ctx context.Context, yes, noPush bool) error {
+	cfg, err := a.loadConfig()
+	if err != nil {
+		return err
+	}
+	st, err := state.Load(a.statePath())
+	if err != nil {
+		return err
+	}
+	return a.applyState(ctx, cfg, st, yes, noPush, false)
+}
+
+func (a *app) cmdRotate(ctx context.Context, yes, noPush bool) error {
+	cfg, err := a.loadConfig()
+	if err != nil {
+		return err
+	}
+	if _, err := state.Load(a.statePath()); err != nil {
+		return err
+	}
+	fmt.Fprintln(a.out, "This replaces the WireGuard keys on both sides. The tunnel is down from the")
+	fmt.Fprintln(a.out, "moment the edge restarts until you run `docker compose up -d` at home.")
+	if !yes && !a.confirm("Rotate keys?") {
+		return errors.New("aborted")
+	}
+	st, err := state.New()
+	if err != nil {
+		return err
+	}
+	return a.applyState(ctx, cfg, st, true, noPush, true)
+}
+
+func (a *app) applyState(ctx context.Context, cfg *config.Config, st *state.State, yes, noPush, saveState bool) error {
+	files, err := a.renderAll(cfg, st)
+	if err != nil {
+		return err
+	}
+	changes, err := a.pending(files)
+	if err != nil {
+		return err
+	}
+	if len(changes) == 0 {
+		fmt.Fprintln(a.out, "Nothing to change: generated files already match hearthgate.yml.")
+		return nil
+	}
+	a.printChanges(changes)
+	if !yes && !a.confirm("Apply these changes?") {
+		return errors.New("aborted; nothing was written")
+	}
+	if saveState {
+		if err := st.Save(a.statePath()); err != nil {
+			return err
+		}
+	}
+	if err := a.write(files); err != nil {
+		return err
+	}
+	fmt.Fprintln(a.out, "Generated files updated.")
+
+	if touches(changes, render.EdgeDir) {
+		switch {
+		case cfg.SSH != "" && !noPush:
+			if err := a.push(ctx, cfg, files); err != nil {
+				return err
+			}
+		default:
+			a.manualEdgeHint(cfg)
+		}
+	}
+	if touches(changes, render.HomeDir) || touches(changes, render.EnvFile) || touches(changes, render.ComposeFile) {
+		fmt.Fprintln(a.out, "Now run `docker compose up -d` to update the home gateway.")
+	}
+	return nil
+}
+
+func (a *app) cmdPush(ctx context.Context) error {
+	cfg, err := a.loadConfig()
+	if err != nil {
+		return err
+	}
+	if cfg.SSH == "" {
+		a.manualEdgeHint(cfg)
+		return errors.New("edge.ssh is not set, so there is nowhere to push to")
+	}
+	st, err := state.Load(a.statePath())
+	if err != nil {
+		return err
+	}
+	files, err := a.renderAll(cfg, st)
+	if err != nil {
+		return err
+	}
+	changes, err := a.pending(files)
+	if err != nil {
+		return err
+	}
+	if len(changes) > 0 {
+		return errors.New("generated files do not match hearthgate.yml; run `ctl apply` first")
+	}
+	return a.push(ctx, cfg, files)
+}

@@ -1,0 +1,37 @@
+# Hearthgate configuration. Edit this file, then run: docker compose run --rm ctl init
+# This file lives on your home server only; it is never sent to the edge.
+# After changing it: docker compose run --rm ctl apply && docker compose up -d
+
+edge:
+  address: 203.0.113.5          # public IP or hostname of the VPS
+  ssh: ubuntu@203.0.113.5       # optional: lets `ctl push` and `ctl check` reach the VPS
+
+# Public hostname -> home container:port (the container must join hearthgate-dmz)
+publish:
+  photos.example.com: immich-server:2283
+
+# Name -> edge container:port (the container must join hearthgate-agents).
+# Home hubs on hearthgate-mgmt reach each one at gateway:<port>.
+agents:
+  beszel: beszel-agent:45876
+  # Long form, for when the port is taken (80, 443, 2019) or used by another agent:
+  # exporter:
+  #   target: node-exporter:9100
+  #   listen: 19100
+
+# Optional settings, shown with their defaults:
+# edge:
+#   ssh_port: 22
+#   dir: hearthgate             # bundle directory on the VPS, relative to the SSH user's home
+#   wireguard_port: 51820
+#   https_port: 443
+#   http_port: 80
+# tls:
+#   ca: letsencrypt             # or letsencrypt-staging, or internal (self-signed, for testing)
+#   email: you@example.com      # no default; contact address for the certificate authority
+# tunnel:
+#   subnet: 10.210.0.0/30
+# networks:
+#   dmz: 10.210.1.0/24
+#   mgmt: 10.210.2.0/24
+#   agents: 10.210.3.0/24

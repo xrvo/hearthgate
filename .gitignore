@@ -1,0 +1,11 @@
+# Your configuration and everything ctl generates from it, including keys.
+/hearthgate.yml
+/generated/
+/.env
+
+# End-to-end test scratch space.
+/tests/e2e/.work/
+
+# Build output.
+/ctl
+/ctl.exe

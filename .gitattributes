@@ -1,0 +1,3 @@
+# Scripts and templates are rendered into files that run on Linux, so they must
+# keep LF line endings on every platform.
+* text=auto eol=lf

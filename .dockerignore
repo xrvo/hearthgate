@@ -1,0 +1,7 @@
+# The ctl image is built from source only. Keep configuration and keys out of
+# the build context.
+*
+!go.mod
+!go.sum
+!cmd
+!internal
