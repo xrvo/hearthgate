@@ -60,6 +60,8 @@ pass() { PASS=$((PASS + 1)); echo "  ok    $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL  $1"; }
 # expect <description> <command...>: the command must succeed.
 expect() { local d=$1; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else fail "$d"; fi; }
+# says <description> <text> <output>: the output must contain the text.
+says() { if echo "$3" | grep -qF -- "$2"; then pass "$1"; else fail "$1"; echo "$3"; fi; }
 # refuse <description> <command...>: the command must fail.
 refuse() { local d=$1; shift; if "$@" >/dev/null 2>&1; then fail "$d"; else pass "$d"; fi; }
 
@@ -169,6 +171,13 @@ else
 	fail "ctl check passes and sees the certificate served from home"
 	echo "$check_out"
 fi
+says "ctl check ends with a plain verdict" "All checks passed." "$check_out"
+home stop caddy >/dev/null 2>&1
+down_out=$(ctl check 2>&1) && down_rc=0 || down_rc=$?
+home start caddy >/dev/null 2>&1
+[ "$down_rc" != 0 ] && pass "ctl check fails while the gateway's TLS listener is down" || fail "ctl check fails while the gateway's TLS listener is down"
+says "the failure says where to look" "no TLS answer came back from home" "$down_out"
+says "and what to run" "docker compose logs caddy" "$down_out"
 expect "ctl apply reports nothing to change" sh -c "docker run --rm -v '$WORK_MOUNT:/work' hearthgate-ctl:e2e apply | grep -q 'Nothing to change'"
 
 echo "== ctl push over SSH (to a throwaway SSH server with a stand-in docker command)"
@@ -191,7 +200,7 @@ docker run -d --name e2e-sshd -p "$SSH_PORT:22" -v "$(hostpath "$PUSH/keys"):/ke
 	mkdir -p /home/tester/.ssh
 	cp /keys/id_ed25519.pub /home/tester/.ssh/authorized_keys
 	chown -R tester /home/tester/.ssh && chmod 700 /home/tester/.ssh
-	printf "#!/bin/sh\necho \"\$@\" >> /tmp/docker-calls\n" > /usr/local/bin/docker
+	printf "#!/bin/sh\necho \"\$@\" | tee -a /tmp/docker-calls\n" > /usr/local/bin/docker
 	chmod +x /usr/local/bin/docker
 	exec /usr/sbin/sshd -D -e' >/dev/null
 for _ in $(seq 1 30); do
@@ -215,12 +224,12 @@ expect "push installed the whole bundle" remote 'cd ~/hearthgate && test -f dock
 expect "pushed WireGuard config is private (mode 600)" remote 'test "$(stat -c %a ~/hearthgate/wireguard/wg_confs/wg0.conf)" = 600'
 expect "push recorded the SSH user for the tunnel container" remote 'grep -q "^HEARTHGATE_PUID=$(id -u)$" ~/hearthgate/.env'
 expect "push started the edge stack" remote 'grep -qx "compose up -d --remove-orphans" /tmp/docker-calls'
+says "push shows the edge's own output as it arrives" "edge | compose up -d --remove-orphans" "$push_out"
+says "push says what it copied and what to run next" "Copied 4 files to tester@host.docker.internal:hearthgate" "$push_out"
 expect "pushed bundle is identical to the rendered one" sh -c "docker exec -u tester e2e-sshd cat /home/tester/hearthgate/nginx.conf | cmp -s - '$PUSH/generated/edge/nginx.conf'"
 
 
 echo "== SSH failures are explained"
-# says <description> <text> <output>: the output must contain the text.
-says() { if echo "$3" | grep -qF -- "$2"; then pass "$1"; else fail "$1"; echo "$3"; fi; }
 first=$(echo "$push_out" | grep -c 'Fingerprint: SHA256:' || true)
 [ "$first" = 1 ] && pass "the first connection shows the host key fingerprint" || { fail "the first connection shows the host key fingerprint"; echo "$push_out"; }
 again=$(pushctl push 2>&1 || true)

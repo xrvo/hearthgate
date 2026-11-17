@@ -7,13 +7,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // keyNames are the private keys ctl looks for in KeyDir, in the order ssh
@@ -172,38 +172,47 @@ func fingerprint(line string) (kind, fp string, ok bool) {
 	return kind, "SHA256:" + base64.RawStdEncoding.EncodeToString(sum[:]), true
 }
 
-// lineFilter passes whole lines through to w, leaving out those that start
-// with drop.
-type lineFilter struct {
-	w    io.Writer
-	drop string
-	buf  []byte
+// lineWriter hands what is written to it to fn one line at a time, cleaned.
+type lineWriter struct {
+	fn  func(string)
+	buf []byte
 }
 
-func (f *lineFilter) Write(p []byte) (int, error) {
-	f.buf = append(f.buf, p...)
+func (w *lineWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
 	for {
-		i := bytes.IndexByte(f.buf, '\n')
+		i := bytes.IndexByte(w.buf, '\n')
 		if i < 0 {
 			return len(p), nil
 		}
-		f.emit(f.buf[:i+1])
-		f.buf = f.buf[i+1:]
+		w.fn(Clean(string(w.buf[:i])))
+		w.buf = w.buf[i+1:]
 	}
 }
 
-// Flush writes out a last line that had no newline.
-func (f *lineFilter) Flush() {
-	if len(f.buf) > 0 {
-		f.emit(f.buf)
-		f.buf = nil
+// Flush hands over a last line that had no newline.
+func (w *lineWriter) Flush() {
+	if len(w.buf) > 0 {
+		w.fn(Clean(string(w.buf)))
+		w.buf = nil
 	}
 }
 
-func (f *lineFilter) emit(line []byte) {
-	if f.w != nil && !bytes.HasPrefix(line, []byte(f.drop)) {
-		f.w.Write(line)
-	}
+// Clean removes control characters from text that came from the edge. The
+// edge is not trusted, and escape sequences printed to a terminal can rewrite
+// what the user sees on it.
+func Clean(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\t' {
+			return r
+		}
+		// Bytes that are not valid UTF-8 go too: 0x9b alone starts an escape
+		// sequence on an 8-bit terminal.
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) || r == utf8.RuneError {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // problem is a failure ctl can explain.

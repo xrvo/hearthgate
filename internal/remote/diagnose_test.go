@@ -91,15 +91,22 @@ func TestFingerprint(t *testing.T) {
 	}
 }
 
-func TestLineFilter(t *testing.T) {
-	var out bytes.Buffer
-	f := &lineFilter{w: &out, drop: "Warning: Permanently added"}
-	for _, chunk := range []string{"Warning: Perman", "ently added 'h' (ED25519).\nPermission ", "denied (publickey).\nlast"} {
-		f.Write([]byte(chunk))
+func TestLineWriter(t *testing.T) {
+	var got []string
+	w := &lineWriter{fn: func(l string) { got = append(got, l) }}
+	for _, chunk := range []string{"Pulling ima", "ge\r\n\x1b[2J\x1b]0;owned\x07Started\x9b31m\n", "last"} {
+		w.Write([]byte(chunk))
 	}
-	f.Flush()
-	if got, want := out.String(), "Permission denied (publickey).\nlast"; got != want {
-		t.Errorf("filtered output = %q, want %q", got, want)
+	w.Flush()
+	want := []string{"Pulling image", "[2J]0;ownedStarted31m", "last"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("lines = %q, want %q", got, want)
+	}
+}
+
+func TestInstallScriptQuoting(t *testing.T) {
+	if s := InstallScript("hearthgate"); strings.Contains(s, "'") || !strings.HasPrefix(s, "mkdir -p hearthgate && cd hearthgate && tar -xzf - && printf ") {
+		t.Errorf("install script = %q", s)
 	}
 }
 

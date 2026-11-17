@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -24,12 +26,23 @@ type reporter struct {
 }
 
 func (r *reporter) ok(format string, args ...any) {
-	fmt.Fprintf(r.app.out, "  ok    %s\n", fmt.Sprintf(format, args...))
+	fmt.Fprintf(r.app.out, "  %s    %s\n", r.app.paint(green, "ok"), fmt.Sprintf(format, args...))
 }
 
 func (r *reporter) fail(format string, args ...any) {
 	r.failed++
-	fmt.Fprintf(r.app.out, "  FAIL  %s\n", fmt.Sprintf(format, args...))
+	fmt.Fprintf(r.app.out, "  %s  %s\n", r.app.paint(red, "FAIL"), fmt.Sprintf(format, args...))
+}
+
+// hint lists, under a failure, what usually causes it and how to fix it.
+func (r *reporter) hint(lines ...string) {
+	for _, l := range lines {
+		fmt.Fprintf(r.app.out, "        %s\n", r.app.paint(dim, "- "+l))
+	}
+}
+
+func (r *reporter) section(title string) {
+	fmt.Fprintln(r.app.out, r.app.paint(bold, title))
 }
 
 // detail prints the explanation of a failure, indented under it.
@@ -40,7 +53,7 @@ func (r *reporter) detail(err error) {
 }
 
 func (r *reporter) skip(format string, args ...any) {
-	fmt.Fprintf(r.app.out, "  skip  %s\n", fmt.Sprintf(format, args...))
+	fmt.Fprintf(r.app.out, "  %s  %s\n", r.app.paint(yellow, "skip"), fmt.Sprintf(format, args...))
 }
 
 func (a *app) cmdCheck(ctx context.Context) error {
@@ -50,7 +63,7 @@ func (a *app) cmdCheck(ctx context.Context) error {
 	}
 	r := &reporter{app: a}
 
-	fmt.Fprintln(a.out, "Configuration")
+	r.section("Configuration")
 	r.ok("%s is valid", a.cfgPath)
 	st, err := state.Load(a.statePath())
 	if err != nil {
@@ -60,17 +73,18 @@ func (a *app) cmdCheck(ctx context.Context) error {
 	} else if changes, err := a.pending(files); err != nil {
 		r.fail("%v", err)
 	} else if len(changes) > 0 {
-		r.fail("generated files do not match hearthgate.yml (%d differ); run `ctl apply`", len(changes))
+		r.fail("generated files do not match hearthgate.yml (%s)", plural(len(changes), "file differs"))
+		r.hint("preview and apply the difference: " + cmdApply)
 	} else {
 		r.ok("generated files match hearthgate.yml")
 	}
 
-	fmt.Fprintln(a.out, "Public endpoints")
+	r.section("Public endpoints")
 	for _, p := range cfg.Publish {
 		checkTLS(ctx, r, cfg, p.Hostname)
 	}
 
-	fmt.Fprintln(a.out, "Tunnel and firewall, seen from the edge")
+	r.section("Tunnel and firewall, seen from the edge")
 	if cfg.SSH == "" {
 		r.skip("edge.ssh is not set, so the edge cannot be inspected")
 	} else {
@@ -78,10 +92,10 @@ func (a *app) cmdCheck(ctx context.Context) error {
 	}
 
 	if r.failed > 0 {
-		fmt.Fprintf(a.out, "\n%d check(s) failed.\n", r.failed)
+		fmt.Fprintf(a.out, "\n%s\n", a.paint(red, plural(r.failed, "check")+" failed.")+" Fix the first one and run check again: later failures often follow from it.")
 		return errReported
 	}
-	fmt.Fprintln(a.out, "\nAll checks passed.")
+	fmt.Fprintf(a.out, "\n%s\n", a.paint(green, "All checks passed."))
 	return nil
 }
 
@@ -97,7 +111,7 @@ func checkTLS(ctx context.Context, r *reporter, cfg *config.Config, hostname str
 	}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		r.fail("%s: no valid TLS connection through %s: %v", hostname, addr, err)
+		tlsFailure(r, cfg, hostname, addr, err)
 		return
 	}
 	defer conn.Close()
@@ -110,6 +124,7 @@ func checkTLS(ctx context.Context, r *reporter, cfg *config.Config, hostname str
 	leaf := certs[0]
 	if err := leaf.VerifyHostname(hostname); err != nil {
 		r.fail("%s: certificate is for a different name: %v", hostname, err)
+		r.hint("something other than this gateway may be answering on "+addr, caddyLogs)
 		return
 	}
 	left := time.Until(leaf.NotAfter)
@@ -117,13 +132,61 @@ func checkTLS(ctx context.Context, r *reporter, cfg *config.Config, hostname str
 	switch {
 	case left <= 0:
 		r.fail("%s: certificate expired on %s", hostname, leaf.NotAfter.Format(time.DateOnly))
+		r.hint("the gateway renews certificates on its own, so something is stopping it", caddyLogs)
 	case !verify:
 		r.ok("%s: certificate from %q (%s CA, chain not verified), expires in %d days", hostname, leaf.Issuer.CommonName, cfg.TLSCA, days)
 	case days < 14:
 		r.fail("%s: certificate expires in %d days and has not been renewed", hostname, days)
+		r.hint("the gateway renews certificates on its own, so something is stopping it", caddyLogs)
 	default:
 		r.ok("%s: trusted certificate, expires in %d days", hostname, days)
 	}
+}
+
+const caddyLogs = "the gateway's log says more: docker compose logs caddy"
+
+// tlsFailure reports a public hostname that could not be reached over TLS,
+// telling apart the three places it can break: the edge's public port, the
+// path from the edge to home, and the certificate itself.
+func tlsFailure(r *reporter, cfg *config.Config, hostname, addr string, err error) {
+	var op *net.OpError
+	var unknownCA x509.UnknownAuthorityError
+	var invalid x509.CertificateInvalidError
+	var wrongHost x509.HostnameError
+	switch {
+	case errors.As(err, &op) && op.Op == "dial":
+		r.fail("%s: cannot connect to the edge at %s: %v", hostname, addr, op.Err)
+		r.hint(
+			"if the edge stack is not running, start it: "+pushCommand,
+			fmt.Sprintf("open %d/tcp in the VPS firewall and in the provider's security group", cfg.HTTPSPort),
+			fmt.Sprintf("check edge.address (%s) in hearthgate.yml", cfg.EdgeAddress),
+		)
+	case errors.As(err, &unknownCA), errors.As(err, &invalid), errors.As(err, &wrongHost):
+		r.fail("%s: the certificate served through %s is not valid: %v", hostname, addr, err)
+		r.hint(
+			fmt.Sprintf("a certificate is issued the first time a hostname is requested, and only if DNS for %s points at %s", hostname, cfg.EdgeAddress),
+			"if you are testing with tls.ca set to letsencrypt-staging or internal, set it in hearthgate.yml so check expects that",
+			caddyLogs,
+		)
+	default:
+		r.fail("%s: the edge at %s accepted the connection, but no TLS answer came back from home: %v", hostname, addr, err)
+		r.hint(
+			"if the home stack is not running, start it: "+cmdUp,
+			"if the tunnel check below fails, fix that first",
+			fmt.Sprintf("the gateway cannot answer for a hostname it has no certificate for; DNS for %s must point at %s", hostname, cfg.EdgeAddress),
+			caddyLogs,
+		)
+	}
+}
+
+// tunnelHints lists why home would not be connected to the edge.
+func tunnelHints(r *reporter, cfg *config.Config) {
+	r.hint(
+		"if the home stack is not running, start it: "+cmdUp+" (`docker compose ps` shows whether the gateway is healthy)",
+		fmt.Sprintf("open %d/udp in the VPS firewall and in the provider's security group: home dials out to that port", cfg.WireGuardPort),
+		fmt.Sprintf("check edge.address (%s) in hearthgate.yml: it is the address home connects to", cfg.EdgeAddress),
+		"after `ctl rotate` both sides need the new keys: "+pushCommand+", then "+cmdUp,
+	)
 }
 
 // checkEdge asks the edge for the handshake age, then tries from inside the
@@ -137,12 +200,15 @@ func (a *app) checkEdge(ctx context.Context, r *reporter, cfg *config.Config) {
 	if err != nil {
 		r.fail("could not query the edge tunnel")
 		r.detail(err)
+		r.hint("if the edge stack is not running, start it: " + pushCommand)
 		return
 	}
 	if age, err := handshakeAge(string(out)); err != nil {
 		r.fail("tunnel: %v", err)
+		tunnelHints(r, cfg)
 	} else if age > maxHandshakeAge {
 		r.fail("tunnel: last handshake was %s ago; home is not connected", age.Round(time.Second))
+		tunnelHints(r, cfg)
 	} else {
 		r.ok("tunnel: last handshake %s ago", age.Round(time.Second))
 	}
@@ -174,11 +240,14 @@ func (a *app) checkEdge(ctx context.Context, r *reporter, cfg *config.Config) {
 		case p == 443 && got == "open":
 			r.ok("edge reaches the home gateway on 443")
 		case p == 443:
-			r.fail("edge cannot reach the home gateway on 443; is the home stack running?")
+			r.fail("edge cannot reach the home gateway on 443")
+			r.hint("if the tunnel check above failed, fix that first", "otherwise start or restart the home stack: "+cmdUp, caddyLogs)
 		case got == "closed":
 			r.ok("home port %d is closed to the edge", p)
 		default:
 			r.fail("home port %d is OPEN to the edge; the home firewall is not in effect", p)
+			r.hint("recreate the gateway so its firewall loads again: "+cmdUp+" --force-recreate",
+				"if the port is still open after that, treat it as a security bug and report it privately (see SECURITY.md)")
 		}
 	}
 }

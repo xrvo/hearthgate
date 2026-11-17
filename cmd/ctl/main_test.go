@@ -5,13 +5,17 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/x509"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/xrvo/hearthgate/internal/config"
 )
 
 const testConfig = `
@@ -65,9 +69,14 @@ func TestInitThenApply(t *testing.T) {
 		read(t, dir, f)
 	}
 
-	// A second init must not replace the keys.
-	if code, out := ctl(t, dir, "", "init"); code == 0 || !strings.Contains(out, "already initialised") {
+	// A second init must not replace the keys. It reports where things stand.
+	stateBefore := read(t, dir, "generated/state.json")
+	code, out := ctl(t, dir, "", "init")
+	if code != 0 || !strings.Contains(out, "Already set up") || !strings.Contains(out, "docker compose run --rm ctl check") {
 		t.Errorf("second init: code %d\n%s", code, out)
+	}
+	if read(t, dir, "generated/state.json") != stateBefore {
+		t.Error("second init replaced the keys")
 	}
 
 	if code, out := ctl(t, dir, "", "apply"); code != 0 || !strings.Contains(out, "Nothing to change") {
@@ -78,9 +87,18 @@ func TestInitThenApply(t *testing.T) {
 	edgeBefore := read(t, dir, "generated/edge/docker-compose.yml")
 	os.WriteFile(filepath.Join(dir, "hearthgate.yml"), []byte(strings.Replace(testConfig, "2283", "3000", 1)), 0o644)
 
-	code, out := ctl(t, dir, "n\n", "apply")
+	if _, out := ctl(t, dir, "", "init"); !strings.Contains(out, "hearthgate.yml has changed") || !strings.Contains(out, "ctl apply") {
+		t.Errorf("init with a pending change does not point at apply:\n%s", out)
+	}
+	code, out = ctl(t, dir, "n\n", "apply")
 	if code == 0 || !strings.Contains(out, "+ 	reverse_proxy immich-server:3000") {
 		t.Errorf("declined apply: code %d\n%s", code, out)
+	}
+	if !strings.Contains(out, "Cancelled; nothing was written.") || strings.Contains(out, "error:") {
+		t.Errorf("declining is reported as an error:\n%s", out)
+	}
+	if !strings.Contains(out, "This changes 2 generated files:") || !strings.Contains(out, "  home  2 files.") || strings.Contains(out, "  edge  ") {
+		t.Errorf("summary does not say which side changes:\n%s", out)
 	}
 	if strings.Contains(read(t, dir, "generated/home/Caddyfile"), "3000") {
 		t.Error("declined apply still wrote files")
@@ -92,6 +110,9 @@ func TestInitThenApply(t *testing.T) {
 	}
 	if !strings.Contains(read(t, dir, "generated/home/Caddyfile"), "immich-server:3000") {
 		t.Error("accepted apply did not update the Caddyfile")
+	}
+	if !strings.Contains(out, "Next:") || !strings.Contains(out, "docker compose run --rm ctl check") {
+		t.Errorf("apply does not end with the next commands:\n%s", out)
 	}
 	if strings.Contains(out, "edge bundle changed") || read(t, dir, "generated/edge/docker-compose.yml") != edgeBefore {
 		t.Errorf("home-only change touched the edge:\n%s", out)
@@ -128,7 +149,7 @@ func TestInitWritesStartingConfig(t *testing.T) {
 	// Once its placeholders are replaced, the example is a working config.
 	edited := strings.NewReplacer("203.0.113.5", "198.51.100.7", "photos.example.com", "photos.example.net").Replace(read(t, dir, "hearthgate.yml"))
 	os.WriteFile(filepath.Join(dir, "hearthgate.yml"), []byte(edited), 0o644)
-	if code, out := ctl(t, dir, "", "init"); code != 0 || !strings.Contains(out, "Generated keys") {
+	if code, out := ctl(t, dir, "", "init"); code != 0 || !strings.Contains(out, "Generated the tunnel keys") {
 		t.Fatalf("init with the edited example: code %d\n%s", code, out)
 	}
 }
@@ -307,7 +328,7 @@ func TestApplyNeverPrintsSecrets(t *testing.T) {
 		}
 	}
 	// With no edge.ssh the user must be told to install the bundle by hand.
-	if !strings.Contains(out, "Install it on the VPS") {
+	if !strings.Contains(out, "install the edge bundle on the VPS") || !strings.Contains(out, "ctl bundle | ssh") {
 		t.Errorf("rotate did not explain the manual edge install:\n%s", out)
 	}
 }
@@ -403,6 +424,82 @@ func TestManualInstallCommand(t *testing.T) {
 	want := "docker compose run --rm -T ctl bundle | ssh -p 2222 <user>@198.51.100.7 'mkdir -p hearthgate && cd hearthgate && tar -xzf - && "
 	if !strings.Contains(out, want) || strings.Count(out, "'") != 2 {
 		t.Errorf("manual install command is wrong or not safely quoted:\n%s", out)
+	}
+}
+
+func TestColor(t *testing.T) {
+	changes := []change{{path: "generated/edge/nginx.conf", lines: []string{"- old", "+ new"}}}
+	var plain, coloured bytes.Buffer
+	(&app{out: &plain}).printChanges(changes)
+	(&app{out: &coloured, color: true}).printChanges(changes)
+	if strings.Contains(plain.String(), "\x1b") {
+		t.Errorf("escape codes without a terminal:\n%q", plain.String())
+	}
+	for _, want := range []string{"\x1b[32m+ new\x1b[0m", "\x1b[31m- old\x1b[0m", "  edge  1 file."} {
+		if !strings.Contains(coloured.String(), want) {
+			t.Errorf("coloured diff lacks %q:\n%q", want, coloured.String())
+		}
+	}
+
+	tty, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Skip("no character device to stand in for a terminal")
+	}
+	defer tty.Close()
+	t.Setenv("TERM", "xterm")
+	t.Setenv("NO_COLOR", "")
+	if !useColor(tty) {
+		t.Error("no colour on a terminal")
+	}
+	t.Setenv("NO_COLOR", "1")
+	if useColor(tty) || useColor(&plain) {
+		t.Error("colour despite NO_COLOR, or without a terminal")
+	}
+}
+
+func TestNextAlignsCommands(t *testing.T) {
+	var out bytes.Buffer
+	long := strings.Repeat("x", 80)
+	(&app{out: &out}).next(step{"short", "one"}, step{long, "two"}, step{"a longer one", "three"})
+	want := "\nNext:\n  short         # one\n  # two\n    " + long + "\n  a longer one  # three\n"
+	if out.String() != want {
+		t.Errorf("next printed:\n%q\nwant:\n%q", out.String(), want)
+	}
+}
+
+func TestCheckHints(t *testing.T) {
+	cfg, err := config.Parse([]byte(testConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := func(err error) string {
+		var out bytes.Buffer
+		r := &reporter{app: &app{out: &out}}
+		tlsFailure(r, cfg, "photos.example.net", "198.51.100.7:443", err)
+		if r.failed != 1 {
+			t.Errorf("failures = %d", r.failed)
+		}
+		return out.String()
+	}
+	dial := report(&net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")})
+	if !strings.Contains(dial, "cannot connect to the edge") || !strings.Contains(dial, "open 443/tcp") || !strings.Contains(dial, "ctl push") {
+		t.Errorf("unreachable edge:\n%s", dial)
+	}
+	silent := report(io.EOF)
+	if !strings.Contains(silent, "no TLS answer came back from home") || !strings.Contains(silent, "docker compose up -d") || !strings.Contains(silent, "DNS for photos.example.net must point at 198.51.100.7") {
+		t.Errorf("silent home:\n%s", silent)
+	}
+	cert := report(x509.UnknownAuthorityError{})
+	if !strings.Contains(cert, "is not valid") || !strings.Contains(cert, "docker compose logs caddy") {
+		t.Errorf("untrusted certificate:\n%s", cert)
+	}
+
+	var out bytes.Buffer
+	tunnelHints(&reporter{app: &app{out: &out}}, cfg)
+	for _, want := range []string{"docker compose up -d", "open 51820/udp", "edge.address (198.51.100.7)", "ctl rotate"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("tunnel hints lack %q:\n%s", want, out.String())
+		}
 	}
 }
 

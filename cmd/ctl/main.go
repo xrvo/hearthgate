@@ -61,6 +61,7 @@ type app struct {
 	in      *bufio.Reader
 	out     io.Writer
 	errw    io.Writer
+	color   bool
 }
 
 func run(ctx context.Context, args []string, in io.Reader, out, errw io.Writer) int {
@@ -68,7 +69,7 @@ func run(ctx context.Context, args []string, in io.Reader, out, errw io.Writer) 
 		fmt.Fprint(out, usage)
 		return 0
 	}
-	a := &app{in: bufio.NewReader(in), out: out, errw: errw}
+	a := &app{in: bufio.NewReader(in), out: out, errw: errw, color: useColor(out)}
 	name, rest := args[0], args[1:]
 
 	fs := flag.NewFlagSet("ctl "+name, flag.ContinueOnError)
@@ -118,6 +119,10 @@ func run(ctx context.Context, args []string, in io.Reader, out, errw io.Writer) 
 	}
 
 	if err := cmd(ctx); err != nil {
+		if errors.Is(err, errCancelled) {
+			fmt.Fprintln(out, "Cancelled; nothing was written.")
+			return 1
+		}
 		if !errors.Is(err, errReported) {
 			fmt.Fprintf(errw, "error: %v\n", withPermissionHelp(err))
 		}
@@ -202,16 +207,6 @@ func touches(changes []change, prefix string) bool {
 	return false
 }
 
-func (a *app) printChanges(changes []change) {
-	for _, c := range changes {
-		fmt.Fprintf(a.out, "\n%s\n", c.path)
-		for _, l := range c.lines {
-			fmt.Fprintf(a.out, "  %s\n", l)
-		}
-	}
-	fmt.Fprintln(a.out)
-}
-
 // write stores changed files only, in place, so the bind mounts of running
 // containers keep pointing at the same files.
 func (a *app) write(files render.Files) error {
@@ -288,16 +283,22 @@ func (a *app) client(cfg *config.Config) *remote.Client {
 }
 
 func (a *app) push(ctx context.Context, cfg *config.Config, files render.Files) error {
-	fmt.Fprintf(a.out, "Pushing the edge bundle to %s:%s ...\n", cfg.SSH, cfg.EdgeDir)
+	bundle := files.WithPrefix(render.EdgeDir)
+	fmt.Fprintf(a.out, "Connecting to %s (port %d) ...\n", cfg.SSH, cfg.SSHPort)
 	c := a.client(cfg)
 	defer c.Close()
-	out, err := c.Push(ctx, files.WithPrefix(render.EdgeDir))
-	a.out.Write(out)
+	err := c.Push(ctx, bundle, func(line string) {
+		if line == remote.MarkCopied {
+			fmt.Fprintf(a.out, "Copied %s to %s:%s. Starting the edge stack ...\n", plural(len(bundle), "file"), cfg.SSH, cfg.EdgeDir)
+			return
+		}
+		fmt.Fprintf(a.out, "  %s %s\n", a.paint(dim, "edge |"), line)
+	})
 	if err != nil {
 		return fmt.Errorf("the edge was not updated.\n\n%w\n\nTo install the edge with your own ssh setup instead (it may use ~/.ssh/config, jump hosts or a password):\n  %s", err, bundleCommand(cfg))
 	}
 	a.markPushed(files)
-	fmt.Fprintln(a.out, "Edge updated.")
+	fmt.Fprintln(a.out, a.paint(green, "The edge is running this configuration."))
 	return nil
 }
 
@@ -314,8 +315,9 @@ func bundleCommand(cfg *config.Config) string {
 	return fmt.Sprintf("docker compose run --rm -T ctl bundle | ssh %s '%s'", target, remote.InstallScript(cfg.EdgeDir))
 }
 
-func (a *app) manualEdgeHint(cfg *config.Config) {
-	fmt.Fprintf(a.out, "The edge bundle changed. Install it on the VPS:\n  %s\n", bundleCommand(cfg))
+// manualStep is the edge install for setups ctl does not push to.
+func manualStep(cfg *config.Config) step {
+	return step{bundleCommand(cfg), "install the edge bundle on the VPS and start it, with your own ssh"}
 }
 
 // scaffold is the first run in a new project directory: it writes a config
@@ -328,9 +330,11 @@ func (a *app) scaffold() error {
 		os.Chown(a.cfgPath, uid, gid)
 	}
 	name := filepath.Base(a.cfgPath)
-	fmt.Fprintf(a.out, "Wrote a starting %s.\n\nNext:\n", name)
-	fmt.Fprintf(a.out, "  edit %s\n", name)
-	fmt.Fprintln(a.out, "  docker compose run --rm ctl init    # generate keys, render both stacks")
+	fmt.Fprintf(a.out, "Wrote a starting %s. Nothing else was generated yet.\n", name)
+	a.next(
+		step{"edit " + name, "set your VPS address and the hostnames to publish"},
+		step{"docker compose run --rm ctl init", "generate keys and both stacks' files"},
+	)
 	return nil
 }
 
@@ -343,7 +347,7 @@ func (a *app) cmdInit(ctx context.Context) error {
 		return err
 	}
 	if state.Exists(a.statePath()) {
-		return fmt.Errorf("already initialised (%s exists).\nUse `ctl apply` after changing hearthgate.yml, or `ctl rotate` to replace the keys", a.statePath())
+		return a.initStatus(cfg)
 	}
 	st, err := state.New()
 	if err != nil {
@@ -362,13 +366,46 @@ func (a *app) cmdInit(ctx context.Context) error {
 	if err := a.write(files); err != nil {
 		return err
 	}
-	fmt.Fprintf(a.out, "Generated keys and %d files under generated/.\n\nNext:\n", len(files))
-	if cfg.SSH != "" {
-		fmt.Fprintln(a.out, "  docker compose run --rm ctl push    # install and start the edge")
-	} else {
-		fmt.Fprintf(a.out, "  install and start the edge with your own ssh:\n    %s\n", bundleCommand(cfg))
+	fmt.Fprintf(a.out, "Generated the tunnel keys and %s:\n", plural(len(files), "file"))
+	fmt.Fprintf(a.out, "  generated/state.json  the keys; keep this file private and backed up\n")
+	fmt.Fprintf(a.out, "  generated/home/       what the home gateway runs from\n")
+	fmt.Fprintf(a.out, "  generated/edge/       the bundle for the VPS\n")
+	fmt.Fprintf(a.out, "  .env                  settings `docker compose` reads for the home stack\n")
+	edge := step{pushCommand, "install and start the edge on " + cfg.SSH}
+	if cfg.SSH == "" {
+		edge = manualStep(cfg)
 	}
-	fmt.Fprintln(a.out, "  docker compose up -d                # start the home gateway")
+	a.next(edge, step{cmdUp, "start the home gateway"}, step{cmdCheck, "verify the tunnel, certificates and firewall"})
+	return nil
+}
+
+// initStatus is `init` on a project that is already set up. It changes
+// nothing and says what the user probably wanted instead.
+func (a *app) initStatus(cfg *config.Config) error {
+	st, err := state.Load(a.statePath())
+	if err != nil {
+		return err
+	}
+	files, err := a.renderAll(cfg, st)
+	if err != nil {
+		return err
+	}
+	changes, err := a.pending(files)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(a.out, "Already set up: the keys and generated files are in place, so init changed nothing.")
+	switch {
+	case len(changes) > 0:
+		fmt.Fprintf(a.out, "hearthgate.yml has changed since they were generated (%s).\n", plural(len(changes), "file differs"))
+		a.next(step{cmdApply, "preview and apply the change"})
+	case a.edgeBehind(cfg, files):
+		fmt.Fprintln(a.out, "ctl has not pushed this configuration to the edge yet.")
+		a.next(step{pushCommand, "install and start the edge on " + cfg.SSH}, step{cmdUp, "start the home gateway"}, step{cmdCheck, "verify the result"})
+	default:
+		a.next(step{cmdUp, "start the home gateway, if it is not running"}, step{cmdCheck, "verify the tunnel, certificates and firewall"})
+	}
+	fmt.Fprintln(a.out, "\nTo change the configuration, edit hearthgate.yml and run `ctl apply`. To replace the keys, run `ctl rotate`.")
 	return nil
 }
 
@@ -398,7 +435,7 @@ func (a *app) cmdRotate(ctx context.Context, yes, noPush bool) error {
 		if ok, err := a.confirmOrYes("Rotate keys?"); err != nil {
 			return err
 		} else if !ok {
-			return errors.New("aborted")
+			return errCancelled
 		}
 	}
 	st, err := state.New()
@@ -423,7 +460,8 @@ func (a *app) applyState(ctx context.Context, cfg *config.Config, st *state.Stat
 	if len(changes) == 0 {
 		fmt.Fprintln(a.out, "Nothing to change: generated files already match hearthgate.yml.")
 		if a.edgeBehind(cfg, files) && !noPush {
-			fmt.Fprintf(a.out, "ctl has not pushed this configuration to the edge, though. Unless you installed it there yourself, run:\n  %s\n", pushCommand)
+			fmt.Fprintln(a.out, "ctl has not pushed this configuration to the edge, though.")
+			a.next(step{pushCommand, "unless you installed it on the VPS yourself"})
 		}
 		return nil
 	}
@@ -435,7 +473,7 @@ func (a *app) applyState(ctx context.Context, cfg *config.Config, st *state.Stat
 		if ok, err := a.confirmOrYes("Apply these changes?"); err != nil {
 			return fmt.Errorf("%w; nothing was written", err)
 		} else if !ok {
-			return errors.New("aborted; nothing was written")
+			return errCancelled
 		}
 	}
 	if saveState {
@@ -446,8 +484,9 @@ func (a *app) applyState(ctx context.Context, cfg *config.Config, st *state.Stat
 	if err := a.write(files); err != nil {
 		return err
 	}
-	fmt.Fprintln(a.out, "Generated files updated.")
+	fmt.Fprintf(a.out, "Wrote %s under generated/.\n", plural(len(changes), "file"))
 
+	var steps []step
 	if touches(changes, render.EdgeDir) {
 		switch {
 		case cfg.SSH != "" && !noPush:
@@ -455,12 +494,16 @@ func (a *app) applyState(ctx context.Context, cfg *config.Config, st *state.Stat
 				return fmt.Errorf("%w\n\n%s", err, afterFailedPush(saveState))
 			}
 		default:
-			a.manualEdgeHint(cfg)
+			fmt.Fprintln(a.out, "The edge bundle changed, and the edge does not have it yet.")
+			steps = append(steps, manualStep(cfg))
 		}
 	}
 	if touches(changes, render.HomeDir) || touches(changes, render.EnvFile) {
-		fmt.Fprintln(a.out, "Now run `docker compose up -d` to update the home gateway.")
+		steps = append(steps, step{cmdUp, "restart the home gateway with the new files"})
+	} else {
+		fmt.Fprintln(a.out, "Nothing changed for the home gateway.")
 	}
+	a.next(append(steps, step{cmdCheck, "verify the result"})...)
 	return nil
 }
 
@@ -470,8 +513,7 @@ func (a *app) cmdPush(ctx context.Context) error {
 		return err
 	}
 	if cfg.SSH == "" {
-		a.manualEdgeHint(cfg)
-		return errors.New("edge.ssh is not set, so there is nowhere to push to")
+		return fmt.Errorf("edge.ssh is not set, so there is nowhere to push to.\nSet it in hearthgate.yml, or install the edge with your own ssh:\n  %s", bundleCommand(cfg))
 	}
 	st, err := state.Load(a.statePath())
 	if err != nil {
@@ -488,7 +530,11 @@ func (a *app) cmdPush(ctx context.Context) error {
 	if len(changes) > 0 {
 		return errors.New("generated files do not match hearthgate.yml; run `ctl apply` first")
 	}
-	return a.push(ctx, cfg, files)
+	if err := a.push(ctx, cfg, files); err != nil {
+		return err
+	}
+	a.next(step{cmdUp, "start the home gateway, or restart it after a change"}, step{cmdCheck, "verify the tunnel, certificates and firewall"})
+	return nil
 }
 
 // cmdBundle writes the edge bundle as a gzipped tarball to standard output.

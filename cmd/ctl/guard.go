@@ -86,7 +86,7 @@ func (a *app) clearStrayDirs(files render.Files, yes bool) error {
 			return fmt.Errorf("there is no terminal to ask on. Remove the directories yourself and run this command again:\n  sudo rmdir %s", strings.Join(dirs, " "))
 		}
 		if !ok {
-			return errors.New("aborted; nothing was written")
+			return errCancelled
 		}
 	}
 	for _, d := range dirs {

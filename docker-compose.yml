@@ -71,6 +71,7 @@ services:
     network_mode: bridge
     environment:
       SSH_AUTH_SOCK: /ssh-agent
+      NO_COLOR: "${NO_COLOR:-}"
       # Lets error messages name the key folder mounted below.
       HEARTHGATE_SSH_DIR_HOST: "${HEARTHGATE_SSH_DIR:-${HOME:-.}/.ssh}"
     volumes:

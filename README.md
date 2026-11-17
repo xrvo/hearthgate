@@ -219,6 +219,8 @@ Run each as `docker compose run --rm ctl <command>`.
 
 `apply` and `rotate` take `-yes` to skip the prompt and `-no-push` to leave the edge to you.
 
+Each command ends by listing the commands to run next. Output is coloured on a terminal; set `NO_COLOR=1` to turn that off.
+
 ## Upgrading
 
 Releases are published as `ghcr.io/xrvo/hearthgate:<version>` for `amd64` and `arm64`, and each release's `docker-compose.yml` names that version. To upgrade, replace the compose file and re-apply:
