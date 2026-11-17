@@ -24,6 +24,13 @@ const maxHandshakeAge = 3 * time.Minute
 type reporter struct {
 	app    *app
 	failed int
+	warned int
+}
+
+// warn reports something that will cause trouble but is not broken now.
+func (r *reporter) warn(format string, args ...any) {
+	r.warned++
+	fmt.Fprintf(r.app.out, "  %s  %s\n", r.app.paint(yellow, "warn"), fmt.Sprintf(format, args...))
 }
 
 func (r *reporter) ok(format string, args ...any) {
@@ -110,6 +117,9 @@ func (a *app) cmdCheck(ctx context.Context) error {
 	r := &reporter{app: a}
 	files := a.reportConfig(r, cfg)
 
+	r.section("DNS")
+	a.reportDNS(ctx, r, cfg)
+
 	r.section("Public endpoints")
 	for _, p := range cfg.Publish {
 		checkTLS(ctx, r, cfg, p.Hostname)
@@ -132,7 +142,7 @@ func (a *app) cmdCheck(ctx context.Context) error {
 		fmt.Fprintf(a.out, "\n%s\n", a.paint(red, plural(r.failed, "check")+" failed.")+" Fix the first one and run check again: later failures often follow from it.")
 		return errReported
 	}
-	fmt.Fprintf(a.out, "\n%s\n", a.paint(green, "All checks passed."))
+	fmt.Fprintf(a.out, "\n%s%s\n", a.paint(green, "All checks passed."), warnings(r))
 	return nil
 }
 

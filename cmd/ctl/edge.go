@@ -165,7 +165,7 @@ echo ::running
 docker compose ps --services --status running || exit $?
 echo ::tunnel
 docker compose exec -T tunnel sh -c "wg show wg0 latest-handshakes; echo now; date +%%s" 2>/dev/null
-exit 0`, cfg.EdgeDir, strings.Join(paths, " "))
+exit 0`, cfg.EdgeDir, strings.Join(append([]string{"/dev/null"}, paths...), " "))
 	out, err := c.Run(ctx, script, nil)
 	if err != nil {
 		return nil, err
@@ -308,6 +308,13 @@ func (a *app) verdict(r *reporter) error {
 		fmt.Fprintf(a.out, "\n%s\n", a.paint(red, plural(r.failed, "problem")+" found.")+" Fix the first one and look again: later ones often follow from it.")
 		return errReported
 	}
-	fmt.Fprintf(a.out, "\n%s\n", a.paint(green, "Everything is in order."))
+	fmt.Fprintf(a.out, "\n%s%s\n", a.paint(green, "Everything is in order."), warnings(r))
 	return nil
+}
+
+func warnings(r *reporter) string {
+	if r.warned == 0 {
+		return ""
+	}
+	return " " + plural(r.warned, "warning") + " above."
 }

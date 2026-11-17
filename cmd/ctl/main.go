@@ -33,8 +33,10 @@ const usage = `Hearthgate ctl: generate and deploy the tunnel configuration.
 Usage: ctl <command> [flags]
 
 Commands:
-  init     Write a starting hearthgate.yml if there is none; once it is
-           edited, generate keys and render both stacks
+  init     Set up a new project: ask for the VPS and a first hostname, write
+           hearthgate.yml, generate keys and render both stacks
+  deploy   Bring the edge in line with hearthgate.yml: check the VPS, apply
+           changes, push, wait for the tunnel and verify
   apply    Re-render after editing hearthgate.yml, preview the diff, update the edge
   push     Copy the edge bundle to the VPS over SSH and start it
   bundle   Write the edge bundle to standard output, to install it with your own ssh
@@ -64,6 +66,7 @@ type app struct {
 	out     io.Writer
 	errw    io.Writer
 	color   bool
+	ctx     context.Context // cancelled by Ctrl-C
 }
 
 func run(ctx context.Context, args []string, in io.Reader, out, errw io.Writer) int {
@@ -71,7 +74,7 @@ func run(ctx context.Context, args []string, in io.Reader, out, errw io.Writer) 
 		fmt.Fprint(out, usage)
 		return 0
 	}
-	a := &app{in: bufio.NewReader(in), out: out, errw: errw, color: useColor(out)}
+	a := &app{in: bufio.NewReader(in), out: out, errw: errw, color: useColor(out), ctx: ctx}
 	name, rest := args[0], args[1:]
 
 	fs := flag.NewFlagSet("ctl "+name, flag.ContinueOnError)
@@ -80,6 +83,7 @@ func run(ctx context.Context, args []string, in io.Reader, out, errw io.Writer) 
 	fs.StringVar(&a.cfgPath, "config", "", "config file (default <dir>/hearthgate.yml)")
 	yes := false
 	noPush := false
+	wait := 60
 	var edge edgeOpts
 
 	var cmd func(context.Context) error
@@ -90,6 +94,10 @@ func run(ctx context.Context, args []string, in io.Reader, out, errw io.Writer) 
 		fs.BoolVar(&yes, "yes", false, "apply without asking")
 		fs.BoolVar(&noPush, "no-push", false, "do not update the edge over SSH")
 		cmd = func(ctx context.Context) error { return a.cmdApply(ctx, yes, noPush) }
+	case "deploy":
+		fs.BoolVar(&yes, "yes", false, "apply pending changes without asking")
+		fs.IntVar(&wait, "wait", 60, "seconds to wait for home to connect")
+		cmd = func(ctx context.Context) error { return a.cmdDeploy(ctx, yes, time.Duration(wait)*time.Second) }
 	case "push":
 		cmd = a.cmdPush
 	case "bundle":
@@ -268,14 +276,38 @@ func (a *app) write(files render.Files) error {
 // as it is under cron, in a pipe, or with `docker compose run -T`.
 var errNoAnswer = errors.New("this needs a yes or no, and there is no terminal to ask on")
 
-func (a *app) confirm(question string) (bool, error) {
-	fmt.Fprintf(a.out, "%s [y/N] ", question)
-	line, err := a.in.ReadString('\n')
-	if err != nil && strings.TrimSpace(line) == "" {
-		fmt.Fprintln(a.out)
-		return false, errNoAnswer
+// ask prints a prompt and returns the trimmed answer. Ctrl-C while it waits
+// cancels the command instead of being ignored until Enter.
+func (a *app) ask(prompt string) (string, error) {
+	fmt.Fprint(a.out, prompt)
+	type result struct {
+		line string
+		err  error
 	}
-	switch strings.ToLower(strings.TrimSpace(line)) {
+	ch := make(chan result, 1)
+	go func() {
+		line, err := a.in.ReadString('\n')
+		ch <- result{line, err}
+	}()
+	select {
+	case r := <-ch:
+		if r.err != nil && strings.TrimSpace(r.line) == "" {
+			fmt.Fprintln(a.out)
+			return "", errNoAnswer
+		}
+		return strings.TrimSpace(r.line), nil
+	case <-a.ctx.Done():
+		fmt.Fprintln(a.out)
+		return "", errCancelled
+	}
+}
+
+func (a *app) confirm(question string) (bool, error) {
+	line, err := a.ask(question + " [y/N] ")
+	if err != nil {
+		return false, err
+	}
+	switch strings.ToLower(line) {
 	case "y", "yes":
 		return true, nil
 	}
@@ -353,11 +385,8 @@ func manualStep(cfg *config.Config) step {
 // scaffold is the first run in a new project directory: it writes a config
 // for the user to edit, and generates nothing until they have.
 func (a *app) scaffold() error {
-	if err := os.WriteFile(a.cfgPath, render.ExampleConfig, 0o644); err != nil {
+	if err := a.writeConfig(render.ExampleConfig); err != nil {
 		return err
-	}
-	if uid, gid, ok := dirOwner(a.dir); ok && uid != 0 && os.Geteuid() == 0 {
-		os.Chown(a.cfgPath, uid, gid)
 	}
 	name := filepath.Base(a.cfgPath)
 	fmt.Fprintf(a.out, "Wrote a starting %s. Nothing else was generated yet.\n", name)
@@ -370,7 +399,18 @@ func (a *app) scaffold() error {
 
 func (a *app) cmdInit(ctx context.Context) error {
 	if _, err := os.Stat(a.cfgPath); errors.Is(err, fs.ErrNotExist) {
-		return a.scaffold()
+		w, err := a.interview()
+		if errors.Is(err, errNoAnswer) {
+			fmt.Fprintln(a.out, "There is no terminal to ask on, so here is an example to edit instead.")
+			return a.scaffold()
+		}
+		if err != nil {
+			return err
+		}
+		if err := a.writeConfig(w.document()); err != nil {
+			return err
+		}
+		fmt.Fprintf(a.out, "\nWrote %s. Edit it any time to publish more hostnames or change settings.\n", filepath.Base(a.cfgPath))
 	}
 	cfg, err := a.loadConfig()
 	if err != nil {
@@ -401,11 +441,12 @@ func (a *app) cmdInit(ctx context.Context) error {
 	fmt.Fprintf(a.out, "  generated/home/       what the home gateway runs from\n")
 	fmt.Fprintf(a.out, "  generated/edge/       the bundle for the VPS\n")
 	fmt.Fprintf(a.out, "  .env                  settings `docker compose` reads for the home stack\n")
-	edge := step{pushCommand, "install and start the edge on " + cfg.SSH}
 	if cfg.SSH == "" {
-		edge = manualStep(cfg)
+		a.next(manualStep(cfg), step{cmdUp, "start the home gateway"}, step{cmdCheck, "verify the certificates"})
+		return nil
 	}
-	a.next(edge, step{cmdUp, "start the home gateway"}, step{cmdCheck, "verify the tunnel, certificates and firewall"})
+	a.next(step{cmdUp, "start the home gateway; it keeps trying until the edge is there"},
+		step{cmdDeploy, "install the edge on " + cfg.SSH + ", wait for the tunnel and verify"})
 	return nil
 }
 
@@ -431,7 +472,7 @@ func (a *app) initStatus(cfg *config.Config) error {
 		a.next(step{cmdApply, "preview and apply the change"})
 	case a.edgeBehind(cfg, files):
 		fmt.Fprintln(a.out, "ctl has not pushed this configuration to the edge yet.")
-		a.next(step{pushCommand, "install and start the edge on " + cfg.SSH}, step{cmdUp, "start the home gateway"}, step{cmdCheck, "verify the result"})
+		a.next(step{cmdUp, "start the home gateway, if it is not running"}, step{cmdDeploy, "install the edge on " + cfg.SSH + ", wait for the tunnel and verify"})
 	default:
 		a.next(step{cmdUp, "start the home gateway, if it is not running"}, step{cmdCheck, "verify the tunnel, certificates and firewall"})
 	}
@@ -480,10 +521,7 @@ func (a *app) applyState(ctx context.Context, cfg *config.Config, st *state.Stat
 	if err != nil {
 		return err
 	}
-	if err := a.clearStrayDirs(files, yes); err != nil {
-		return err
-	}
-	changes, err := a.pending(files)
+	changes, err := a.stage(cfg, st, files, yes, saveState)
 	if err != nil {
 		return err
 	}
@@ -495,26 +533,6 @@ func (a *app) applyState(ctx context.Context, cfg *config.Config, st *state.Stat
 		}
 		return nil
 	}
-	a.printChanges(changes)
-	for _, note := range networkNotes(changes) {
-		fmt.Fprintf(a.out, "%s\n\n", note)
-	}
-	if !yes {
-		if ok, err := a.confirmOrYes("Apply these changes?"); err != nil {
-			return fmt.Errorf("%w; nothing was written", err)
-		} else if !ok {
-			return errCancelled
-		}
-	}
-	if saveState {
-		if err := st.Save(a.statePath()); err != nil {
-			return err
-		}
-	}
-	if err := a.write(files); err != nil {
-		return err
-	}
-	fmt.Fprintf(a.out, "Wrote %s under generated/.\n", plural(len(changes), "file"))
 
 	var steps []step
 	if touches(changes, render.EdgeDir) {

@@ -44,7 +44,7 @@ teardown() {
 	docker compose -p hearthgate-e2e-edge down -v --remove-orphans >/dev/null 2>&1 || true
 	docker compose -p hearthgate-e2e-nossh down -v --remove-orphans >/dev/null 2>&1 || true
 	# Generated files may belong to the container user, so remove them from a container.
-	docker run --rm -v "$WORK_MOUNT:/w" "$ALPINE" sh -c 'rm -rf /w/generated /w/.env /w/push /w/nossh /w/edgekeys' >/dev/null 2>&1 || true
+	docker run --rm -v "$WORK_MOUNT:/w" "$ALPINE" sh -c 'rm -rf /w/generated /w/.env /w/push /w/nossh /w/edgekeys /w/wizard' >/dev/null 2>&1 || true
 	rm -rf "$WORK"
 }
 cleanup() {
@@ -89,9 +89,11 @@ EOF
 docker build -q -t hearthgate-ctl:e2e "$(hostpath "$ROOT")" >/dev/null
 ctl init
 
-echo "== Starting the edge, then home"
-edge up -d
+# Home first, as the quick start has it: the gateway must come up and keep
+# trying while there is no edge to connect to yet.
+echo "== Starting home, then the edge"
 home up -d gateway caddy stream
+edge up -d
 docker run -d --name e2e-app --network hearthgate-dmz "$WHOAMI" >/dev/null
 docker run -d --name e2e-agent --network hearthgate-agents "$WHOAMI" >/dev/null
 
@@ -246,6 +248,17 @@ edge:
 publish:
   app.e2e.test: e2e-app:80
 EOF
+# Stands in for docker on this SSH server: it answers the questions deploy
+# asks before it starts, and records everything else.
+cat > "$PUSH/keys/docker-stub" <<'EOF'
+#!/bin/sh
+case "$*" in
+	"version --format"*) echo 29.0.0 ;;
+	"compose version --short") echo 2.40.0 ;;
+	"compose ps"*) ;;
+	*) echo "$@" | tee -a /tmp/docker-calls ;;
+esac
+EOF
 docker run -d --name e2e-sshd -p "$SSH_PORT:22" -v "$(hostpath "$PUSH/keys"):/keys" "$ALPINE" sh -c '
 	set -e
 	apk add --no-cache openssh-server >/dev/null
@@ -255,7 +268,7 @@ docker run -d --name e2e-sshd -p "$SSH_PORT:22" -v "$(hostpath "$PUSH/keys"):/ke
 	mkdir -p /home/tester/.ssh
 	cp /keys/id_ed25519.pub /home/tester/.ssh/authorized_keys
 	chown -R tester /home/tester/.ssh && chmod 700 /home/tester/.ssh
-	printf "#!/bin/sh\necho \"\$@\" | tee -a /tmp/docker-calls\n" > /usr/local/bin/docker
+	cp /keys/docker-stub /usr/local/bin/docker
 	chmod +x /usr/local/bin/docker
 	exec /usr/sbin/sshd -D -e' >/dev/null
 for _ in $(seq 1 30); do
@@ -283,6 +296,25 @@ says "push shows the edge's own output as it arrives" "edge | compose up -d --re
 says "push says what it copied and what to run next" "Copied 4 files to tester@host.docker.internal:hearthgate" "$push_out"
 up_out=$(pushctl edge up 2>&1 || true)
 says "edge up starts the installed stack" "edge | compose up -d --remove-orphans" "$up_out"
+
+echo "== ctl deploy (same SSH server; no home is connected to it)"
+docker exec -d e2e-sshd nc -l -p 80
+sleep 1
+busy_out=$(pushctl deploy -yes -wait 2 2>&1) && busy_rc=0 || busy_rc=$?
+[ "$busy_rc" != 0 ] && pass "deploy fails while another program holds a public port on the VPS" || fail "deploy fails while another program holds a public port on the VPS"
+says "it names the port" "1 port already in use on the VPS by another program: 80/tcp" "$busy_out"
+says "it stops before changing anything" "Deploy stopped. Nothing was changed." "$busy_out"
+docker exec e2e-sshd pkill nc || true
+remote 'rm -f /tmp/docker-calls'
+deploy_out=$(pushctl deploy -yes -wait 2 2>&1) && deploy_rc=0 || deploy_rc=$?
+says "deploy checks Docker and Compose on the VPS first" "Docker 29.0.0 and Compose 2.40.0 on the VPS" "$deploy_out"
+says "deploy finds the public ports free" "ports 443/tcp, 80/tcp, 51820/udp are free on the VPS" "$deploy_out"
+says "deploy warns that the hostname has no DNS record" "warn  DNS: app.e2e.test does not resolve yet" "$deploy_out"
+says "deploy pushes the bundle" "Copied 4 files" "$deploy_out"
+expect "deploy started the edge stack" remote 'grep -qx "compose up -d --remove-orphans" /tmp/docker-calls'
+says "deploy reports that home never connected" "Home has not connected." "$deploy_out"
+[ "$deploy_rc" != 0 ] && pass "deploy fails when the tunnel does not come up" || fail "deploy fails when the tunnel does not come up"
+
 expect "pushed bundle is identical to the rendered one" sh -c "docker exec -u tester e2e-sshd cat /home/tester/hearthgate/nginx.conf | cmp -s - '$PUSH/generated/edge/nginx.conf'"
 
 
@@ -338,6 +370,14 @@ out=$(pushctl apply -yes -no-push 2>&1; pushctl push 2>&1 || true)
 # Linux refuses the connection; Docker Desktop reports the port unreachable.
 says "a wrong SSH port is explained" "edge.ssh_port" "$out"
 says "a failed push says how to retry" "docker compose run --rm -T ctl bundle" "$out"
+
+echo "== ctl init asks its questions and sets a project up in one run"
+WIZ="$WORK/wizard"
+mkdir -p "$WIZ"
+wiz_out=$(printf '198.51.100.7\nroot\nphotos.e2e.test\napp:80\n' | docker run --rm -i -v "$(hostpath "$WIZ"):/work" hearthgate-ctl:e2e init 2>&1 || true)
+says "init generates the keys from the answers" "Generated the tunnel keys" "$wiz_out"
+says "init points at deploy" "docker compose run --rm ctl deploy" "$wiz_out"
+expect "init wrote the answers to hearthgate.yml" grep -q "ssh: root@198.51.100.7" "$WIZ/hearthgate.yml"
 
 echo "== The home stack does not need an SSH folder to start ctl"
 NOSSH="$WORK/nossh"
