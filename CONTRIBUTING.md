@@ -6,7 +6,7 @@ Issues and pull requests are welcome. For anything that affects the trust bounda
 
 | Path | What it is |
 |---|---|
-| `cmd/ctl` | The command-line tool: `init`, `apply`, `push`, `check`, `rotate` |
+| `cmd/ctl` | The command-line tool and all its commands |
 | `internal/config` | Parses and validates `hearthgate.yml` |
 | `internal/render` | Turns config and keys into the generated files; templates are in `templates/` |
 | `internal/remote` | Reaches the edge through the system `ssh` client |
@@ -25,7 +25,7 @@ go vet ./... && go test ./...
 bash tests/e2e/run.sh
 ```
 
-The end-to-end test needs Docker with Compose v2 and a kernel with WireGuard. It creates the real `hearthgate-*` networks, so don't run it on a machine hosting a live deployment. `KEEP=1 bash tests/e2e/run.sh` leaves everything running for inspection.
+The end-to-end test needs Docker with Compose 2.17 or newer and a kernel with WireGuard. It creates the real `hearthgate-*` networks, so don't run it on a machine hosting a live deployment. `KEEP=1 bash tests/e2e/run.sh` leaves everything running for inspection.
 
 ## Rules for changes
 
@@ -43,6 +43,10 @@ The end-to-end test needs Docker with Compose v2 and a kernel with WireGuard. It
 2. Tag that commit `v0.2.0` and push the tag.
 
 The release workflow fails before publishing anything if the two versions differ.
+
+## Documentation
+
+The website and documentation at [hearthgate.io](https://hearthgate.io) are built from a separate repository, [xrvo/hearthgate-site](https://github.com/xrvo/hearthgate-site). Its pages are written from this README and the source, so a change to behaviour needs a change there too. That repository's README lists which page follows which file here. The pages most likely to need it are the quick start, the configuration and `ctl` references, and troubleshooting, which quotes the messages `ctl` prints.
 
 ## Style
 

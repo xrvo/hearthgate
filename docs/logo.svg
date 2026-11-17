@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <defs><linearGradient id="hg-logo-g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffb35c"/><stop offset="1" stop-color="#e8552b"/></linearGradient><mask id="hg-logo-k"><rect width="32" height="32" fill="#fff"/><circle cx="16" cy="14.5" r="4.6" fill="#000"/><path d="M13.7 17h4.6l1.4 8.5h-7.4z" fill="#000"/></mask></defs>
+  <path d="M4 14a12 12 0 0 1 24 0v14a1.5 1.5 0 0 1-1.5 1.5h-21A1.5 1.5 0 0 1 4 28z" fill="url(#hg-logo-g)" mask="url(#hg-logo-k)"/>
+</svg>

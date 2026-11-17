@@ -1,6 +1,15 @@
-# Hearthgate
+<p align="center"><img src="docs/logo.svg" width="96" height="96" alt=""></p>
 
-**A self-hosted tunnel for people who don't trust their VPS.**
+<h1 align="center">Hearthgate</h1>
+
+<p align="center"><strong>A self-hosted tunnel for people who don't trust their VPS.</strong></p>
+
+<p align="center">
+  <a href="https://hearthgate.io">Website</a> ·
+  <a href="https://hearthgate.io/docs/quick-start/">Quick start</a> ·
+  <a href="https://hearthgate.io/docs/">Docs</a> ·
+  <a href="https://hearthgate.io/docs/concepts/security-model/">Security model</a>
+</p>
 
 Tools like Pangolin, Cloudflare Tunnel and most reverse-proxy-on-a-VPS setups share one design choice: TLS ends on the cloud server, and the cloud server decides what it can reach inside your network. Whoever controls that server (a provider, an attacker, a bad image update) can read your logins and reconfigure its way further in.
 
@@ -75,7 +84,7 @@ If `docker compose up -d` reports that the gateway did not start, `docker compos
 
 `ctl` reaches the VPS as `edge.ssh`. It signs in with your SSH agent, or with `id_ed25519`, `id_ecdsa` or `id_rsa` from `~/.ssh`. It does not read `~/.ssh/config`. If your keys live elsewhere, set `HEARTHGATE_SSH_DIR` to that directory.
 
-If it cannot connect, `ctl` says why (no key found, key not authorised on the VPS, wrong port, changed host key, Docker missing on the VPS) and lists what to try. The first time it connects it shows the VPS's host key fingerprint and remembers the key in `generated/known_hosts`.
+If it cannot connect, `ctl` says why (no key found, key not authorised on the VPS, wrong port, changed host key, Docker missing on the VPS) and lists what to try. The [troubleshooting guide](https://hearthgate.io/docs/guides/troubleshooting/) explains each message `ctl` prints. The first time it connects it shows the VPS's host key fingerprint and remembers the key in `generated/known_hosts`.
 
 If you have no `~/.ssh` folder yet, Docker creates an empty one owned by root when `ctl` first runs. Take it back with `sudo chown "$(id -u):$(id -g)" ~/.ssh` before you make a key in it.
 
@@ -100,7 +109,7 @@ Your containers join a network. They need no published ports, extra capabilities
 | Home monitoring hub | `hearthgate-mgmt` | It reaches each agent at `gateway:<port>` |
 | Edge agent | `hearthgate-agents` | It is reachable from home only |
 
-The examples use [Immich](https://immich.app) and [Beszel](https://beszel.dev), but any HTTP app and any hub-and-agent tool work the same way.
+The examples use [Immich](https://immich.app) and [Beszel](https://beszel.dev), but any HTTP app and any hub-and-agent tool work the same way. The guides [Publish a service](https://hearthgate.io/docs/guides/publish-a-service/) and [Monitor the edge](https://hearthgate.io/docs/guides/monitor-the-edge/) go through each step by step.
 
 ### Home: publish Immich
 
@@ -155,7 +164,7 @@ In the hub, add a system with host `gateway` and port `45876`. Leave the agent's
 
 ## Configuration
 
-`hearthgate.yml` is the only file you edit. It never leaves your home server.
+`hearthgate.yml` is the only file you edit. It never leaves your home server. The [configuration reference](https://hearthgate.io/docs/reference/configuration/) has a full example and the validation rules.
 
 | Key | Default | Description |
 |---|---|---|
@@ -196,7 +205,7 @@ docker compose up -d                 # picks up the change at home
 
 ## Commands
 
-Run each as `docker compose run --rm ctl <command>`.
+Run each as `docker compose run --rm ctl <command>`. The [`ctl` reference](https://hearthgate.io/docs/reference/ctl/) covers every flag, exit status and environment variable.
 
 | Command | What it does |
 |---|---|
@@ -211,6 +220,7 @@ Run each as `docker compose run --rm ctl <command>`.
 | `edge logs` | Shows the edge's logs; `-f` follows, `-tail N` sets the length, and `tunnel` or `proxy` picks one service |
 | `check` | Tests DNS, the certificates, the tunnel handshake, and that home ports other than 443 are closed to the edge |
 | `rotate` | Replaces the WireGuard keys on both sides |
+| `version` | Prints the Hearthgate version |
 
 `deploy` is `apply`, `push` and `check` in one, with a check of the VPS in front; the separate commands remain for doing one step at a time. `deploy`, `apply` and `rotate` take `-yes` to skip the prompt. `apply` and `rotate` take `-no-push` to leave the edge to you, and `deploy -wait N` sets how many seconds to wait for the tunnel (60 by default).
 
@@ -240,6 +250,8 @@ docker compose run --rm ctl apply   # shows what the new release changes, then u
 docker compose up -d
 ```
 
+[Updates and maintenance](https://hearthgate.io/docs/guides/maintenance/) also covers rotating keys, backing up, moving to a different VPS and removing Hearthgate.
+
 ## How it works
 
 Each side runs a tunnel container, holding the WireGuard interface and the firewall, with proxies sharing its network namespace.
@@ -253,7 +265,7 @@ Each side runs a tunnel container, holding the WireGuard interface and the firew
 - **Image:** one image, `ghcr.io/xrvo/hearthgate`, runs every container on both sides. This repository builds it and publishes it with a build provenance attestation. It packages Caddy and nginx from their official images, pinned by digest in the [`Dockerfile`](Dockerfile), with WireGuard's `wg`, `iptables` and OpenSSH from Alpine's package repository. Alpine packages are installed when the image is built and are not pinned individually.
 - **Own code:** `ctl`, a Go program that runs one-shot and never listens on the network, and a short [shell entrypoint](image/hearthgate) that brings up the tunnel and firewall and starts each proxy.
 
-Everything `ctl` writes is in `generated/` and `.env`, plus the starting `hearthgate.yml`. Keep `generated/state.json` private and backed up: it holds the tunnel keys.
+Everything `ctl` writes is in `generated/` and `.env`, plus the starting `hearthgate.yml`. Keep `generated/state.json` private and backed up: it holds the tunnel keys. That file and `hearthgate.yml` are enough to rebuild everything else: put them beside `docker-compose.yml` on a new home server and run `ctl apply`.
 
 ## Security model
 
@@ -288,6 +300,7 @@ Report security issues privately; see [SECURITY.md](SECURITY.md).
 - **The tunnel endpoint is resolved once,** when the gateway starts. If `edge.address` is a hostname that can't be resolved then, the gateway restarts itself until it can. If the address behind the name changes later, restart the gateway.
 - **No wildcard certificates.** Each published hostname gets its own certificate.
 - **HTTP services only.** Raw TCP and UDP publishing are on the roadmap.
+- **One edge.** A deployment has a single VPS.
 
 ## Alternatives
 
@@ -315,6 +328,14 @@ Run your auth proxy at home on `hearthgate-dmz` and publish that instead of the 
 
 **Can I try it before pointing DNS at the VPS?**
 Set `tls.ca: internal` to get self-signed certificates, or `letsencrypt-staging` to rehearse issuance without using up rate limits.
+
+**Do I need a DNS API token?**
+No. Certificates use the TLS-ALPN-01 challenge, which works through the passthrough. The only DNS you need is a record for each hostname, pointing at the VPS.
+
+**Can I use Cloudflare's proxy (the orange cloud) in front?**
+No. A proxying CDN ends TLS itself, which is what Hearthgate avoids, and the certificate challenge would not reach home. Set the records to DNS only.
+
+More in the [FAQ](https://hearthgate.io/docs/faq/) on the website.
 
 ## Roadmap
 
