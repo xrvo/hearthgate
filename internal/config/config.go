@@ -163,7 +163,7 @@ func Parse(data []byte) (*Config, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&raw); err != nil {
-		return nil, fmt.Errorf("invalid YAML: %w", err)
+		return nil, yamlError(err)
 	}
 
 	var errs []error

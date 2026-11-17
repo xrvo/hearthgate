@@ -13,8 +13,8 @@ import (
 
 func TestArchiveRoundTrip(t *testing.T) {
 	bundle := render.Files{
-		"docker-compose.yml":          {Content: []byte("services: {}\n"), Mode: 0o644},
-		"wireguard/wg_confs/wg0.conf": {Content: []byte("[Interface]\n"), Mode: 0o600},
+		"docker-compose.yml": {Content: []byte("services: {}\n"), Mode: 0o644},
+		"tunnel/wg0.conf":    {Content: []byte("[Interface]\n"), Mode: 0o600},
 	}
 	data, err := Archive(bundle, time.Unix(1700000000, 0))
 	if err != nil {

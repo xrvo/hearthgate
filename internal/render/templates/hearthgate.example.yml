@@ -1,6 +1,6 @@
 # Hearthgate configuration. Edit this file, then run: docker compose run --rm ctl init
 # This file lives on your home server only; it is never sent to the edge.
-# After changing it: docker compose run --rm ctl apply && docker compose up -d
+# After changing it: docker compose run --rm ctl deploy && docker compose up -d
 
 edge:
   address: 203.0.113.5          # public IP or hostname of the VPS

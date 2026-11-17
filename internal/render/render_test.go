@@ -11,6 +11,8 @@ import (
 	"github.com/xrvo/hearthgate/internal/state"
 )
 
+const testImage = "ghcr.io/xrvo/hearthgate:9.9.9"
+
 const sample = `
 edge:
   address: 203.0.113.5
@@ -32,7 +34,7 @@ func mustRender(t *testing.T, yaml string) (Files, *state.State) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	files, err := Render(cfg, st)
+	files, err := Render(cfg, st, testImage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,11 +62,11 @@ func wantAll(t *testing.T, name, got string, wants ...string) {
 func TestRenderIsDeterministic(t *testing.T) {
 	cfg, _ := config.Parse([]byte(sample))
 	st, _ := state.New()
-	a, err := Render(cfg, st)
+	a, err := Render(cfg, st, testImage)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, _ := Render(cfg, st)
+	b, _ := Render(cfg, st, testImage)
 	for _, p := range a.Paths() {
 		if !bytes.Equal(a[p].Content, b[p].Content) {
 			t.Errorf("%s differs between two renders", p)
@@ -77,23 +79,38 @@ func TestWireGuardConfs(t *testing.T) {
 	homePub, _ := keys.Public(st.HomePrivate)
 	edgePub, _ := keys.Public(st.EdgePrivate)
 
-	home := content(t, files, HomeDir+"wireguard/wg_confs/wg0.conf")
+	home := content(t, files, HomeDir+"tunnel/wg0.conf")
 	wantAll(t, "home wg0.conf", home,
-		"Address = 10.210.0.2/32", "PrivateKey = "+st.HomePrivate, "PublicKey = "+edgePub,
+		"PrivateKey = "+st.HomePrivate, "PublicKey = "+edgePub,
 		"Endpoint = 203.0.113.5:51820", "AllowedIPs = 10.210.0.1/32", "PersistentKeepalive = 25")
 	if strings.Contains(home, st.EdgePrivate) {
 		t.Error("home wg0.conf contains the edge private key")
 	}
 
-	edge := content(t, files, EdgeDir+"wireguard/wg_confs/wg0.conf")
+	edge := content(t, files, EdgeDir+"tunnel/wg0.conf")
 	wantAll(t, "edge wg0.conf", edge,
-		"Address = 10.210.0.1/32", "ListenPort = 51820", "PrivateKey = "+st.EdgePrivate,
+		"ListenPort = 51820", "PrivateKey = "+st.EdgePrivate,
 		"PublicKey = "+homePub, "AllowedIPs = 10.210.0.2/32")
 	if strings.Contains(edge, "Endpoint") {
 		t.Error("edge wg0.conf has an Endpoint; home must be the side that dials")
 	}
 
-	for _, p := range []string{HomeDir + "wireguard/wg_confs/wg0.conf", EdgeDir + "wireguard/wg_confs/wg0.conf"} {
+	// `wg setconf` rejects the keys only wg-quick understands.
+	for _, conf := range []string{home, edge} {
+		for _, bad := range []string{"Address", "PostUp", "DNS", "MTU"} {
+			if strings.Contains(conf, bad) {
+				t.Errorf("wg0.conf has %q, which `wg setconf` does not accept:\n%s", bad, conf)
+			}
+		}
+	}
+	if got := content(t, files, HomeDir+"tunnel/tunnel.env"); got != "ADDRESS=10.210.0.2\nPEER=10.210.0.1\n" {
+		t.Errorf("home tunnel.env = %q", got)
+	}
+	if got := content(t, files, EdgeDir+"tunnel/tunnel.env"); got != "ADDRESS=10.210.0.1\nPEER=10.210.0.2\n" {
+		t.Errorf("edge tunnel.env = %q", got)
+	}
+
+	for _, p := range []string{HomeDir + "tunnel/wg0.conf", EdgeDir + "tunnel/wg0.conf"} {
 		if files[p].Mode != 0o600 {
 			t.Errorf("%s mode = %o, want 600", p, files[p].Mode)
 		}
@@ -118,7 +135,7 @@ func TestEdgeBundleHoldsNoHomeSecrets(t *testing.T) {
 
 func TestHomeFirewall(t *testing.T) {
 	files, _ := mustRender(t, sample)
-	fw := content(t, files, HomeDir+"wireguard/firewall.sh")
+	fw := content(t, files, HomeDir+"tunnel/firewall.sh")
 	wantAll(t, "home firewall", fw,
 		"iptables -P INPUT DROP", "iptables -P FORWARD DROP",
 		`iptables -A INPUT -i "$WG" -s 10.210.0.1 -d 10.210.0.2 -p tcp --dport 443 -j ACCEPT`,
@@ -146,7 +163,7 @@ func TestHomeFirewall(t *testing.T) {
 
 func TestEdgeFirewall(t *testing.T) {
 	files, _ := mustRender(t, sample)
-	fw := content(t, files, EdgeDir+"wireguard/firewall.sh")
+	fw := content(t, files, EdgeDir+"tunnel/firewall.sh")
 	wantAll(t, "edge firewall", fw,
 		"iptables -P INPUT DROP", "iptables -P FORWARD DROP",
 		`iptables -A INPUT -i "$WG" -s 10.210.0.2 -d 10.210.0.1 -p tcp --dport 45876 -j ACCEPT`,
@@ -158,7 +175,7 @@ func TestEdgeFirewall(t *testing.T) {
 
 func TestCaddyfile(t *testing.T) {
 	files, _ := mustRender(t, sample)
-	c := content(t, files, HomeDir+"Caddyfile")
+	c := content(t, files, HomeDir+"caddy/Caddyfile")
 	wantAll(t, "Caddyfile", c,
 		"default_bind 10.210.0.2", "allow 10.210.0.1/32", "fallback_policy reject",
 		"disable_http_challenge", "admin off",
@@ -169,26 +186,26 @@ func TestCaddyfile(t *testing.T) {
 	}
 
 	internal, _ := mustRender(t, sample+"tls: {ca: internal, email: me@example.com}\n")
-	ci := content(t, internal, HomeDir+"Caddyfile")
+	ci := content(t, internal, HomeDir+"caddy/Caddyfile")
 	wantAll(t, "internal Caddyfile", ci, "local_certs", "email me@example.com")
 	if strings.Contains(ci, "cert_issuer") {
 		t.Error("internal CA must not configure ACME")
 	}
 
 	staging, _ := mustRender(t, sample+"tls: {ca: letsencrypt-staging}\n")
-	wantAll(t, "staging Caddyfile", content(t, staging, HomeDir+"Caddyfile"),
+	wantAll(t, "staging Caddyfile", content(t, staging, HomeDir+"caddy/Caddyfile"),
 		"dir https://acme-staging-v02.api.letsencrypt.org/directory", "disable_http_challenge")
 }
 
 func TestStreamProxies(t *testing.T) {
 	files, _ := mustRender(t, sample)
 
-	home := content(t, files, HomeDir+"nginx.conf")
+	home := content(t, files, HomeDir+"stream/nginx.conf")
 	wantAll(t, "home nginx.conf", home,
 		"listen 10.210.2.2:45876;", "proxy_pass 10.210.0.1:45876;",
 		"listen 10.210.2.2:18080;", "proxy_pass 10.210.0.1:18080;")
 
-	edge := content(t, files, EdgeDir+"nginx.conf")
+	edge := content(t, files, EdgeDir+"proxy/nginx.conf")
 	wantAll(t, "edge nginx.conf", edge,
 		"listen 443;", "proxy_pass 10.210.0.2:443;", "proxy_protocol on;",
 		"listen 10.210.0.1:45876;", `45876 "beszel-agent:45876";`,
@@ -201,21 +218,21 @@ func TestStreamProxies(t *testing.T) {
 
 func TestNoAgents(t *testing.T) {
 	files, _ := mustRender(t, "edge: {address: 203.0.113.5}\npublish: {a.example.com: app:80}\n")
-	edge := content(t, files, EdgeDir+"nginx.conf")
+	edge := content(t, files, EdgeDir+"proxy/nginx.conf")
 	if strings.Contains(edge, "agent_upstream") || strings.Contains(edge, "resolver") {
 		t.Errorf("edge nginx.conf mentions agents when none are configured:\n%s", edge)
 	}
-	if strings.Contains(content(t, files, HomeDir+"nginx.conf"), "listen") {
+	if strings.Contains(content(t, files, HomeDir+"stream/nginx.conf"), "listen") {
 		t.Error("home nginx.conf listens when no agents are configured")
 	}
 }
 
 func TestCustomPorts(t *testing.T) {
 	files, _ := mustRender(t, "edge: {address: vps.example.net, https_port: 8443, http_port: 8080, wireguard_port: 51900}\npublish: {a.example.com: app:80}\n")
-	wantAll(t, "edge nginx.conf", content(t, files, EdgeDir+"nginx.conf"), "return 301 https://$host:8443$request_uri;")
+	wantAll(t, "edge nginx.conf", content(t, files, EdgeDir+"proxy/nginx.conf"), "return 301 https://$host:8443$request_uri;")
 	wantAll(t, "edge compose", content(t, files, EdgeDir+"docker-compose.yml"),
-		`"51900:51820/udp"`, `"8443:443"`, `"8080:80"`, ImageWireGuard, ImageNginx, "name: hearthgate-agents")
-	wantAll(t, "home wg0.conf", content(t, files, HomeDir+"wireguard/wg_confs/wg0.conf"), "Endpoint = vps.example.net:51900")
+		`"51900:51820/udp"`, `"8443:443"`, `"8080:80"`, "image: "+testImage, "name: hearthgate-agents")
+	wantAll(t, "home wg0.conf", content(t, files, HomeDir+"tunnel/wg0.conf"), "Endpoint = vps.example.net:51900")
 }
 
 func TestHashesTrackContent(t *testing.T) {
@@ -231,8 +248,8 @@ func TestHashesTrackContent(t *testing.T) {
 	cfgA, _ := config.Parse([]byte(sample))
 	cfgB, _ := config.Parse([]byte(strings.Replace(sample, "paperless:8000", "paperless:8001", 1)))
 	st, _ := state.New()
-	a, _ := Render(cfgA, st)
-	b, _ := Render(cfgB, st)
+	a, _ := Render(cfgA, st, testImage)
+	b, _ := Render(cfgB, st, testImage)
 
 	if envHash(a) == envHash(b) {
 		t.Error("home hash did not change when a published target changed")
@@ -243,26 +260,71 @@ func TestHashesTrackContent(t *testing.T) {
 	}
 }
 
-// The home stack's compose file is static, so its image pins can drift from
-// the ones rendered into the edge bundle unless something checks. Users copy
-// the file on its own, so it must also run without a source checkout.
-func TestHomeComposeUsesPinnedImages(t *testing.T) {
+// No container may be handed another's files: the proxies run beside a tunnel
+// and must not be able to read its keys.
+func TestEachContainerGetsItsOwnDirectory(t *testing.T) {
+	files, st := mustRender(t, sample)
+	for p, f := range files {
+		holdsKey := strings.Contains(string(f.Content), st.HomePrivate) || strings.Contains(string(f.Content), st.EdgePrivate) ||
+			strings.Contains(string(f.Content), st.Preshared)
+		inTunnel := strings.HasPrefix(p, HomeDir+"tunnel/") || strings.HasPrefix(p, EdgeDir+"tunnel/")
+		if holdsKey && !inTunnel {
+			t.Errorf("%s holds key material outside a tunnel directory", p)
+		}
+	}
+	edge := content(t, files, EdgeDir+"docker-compose.yml")
+	wantAll(t, "edge compose", edge, "- ./tunnel:/etc/hearthgate:ro", "- ./proxy:/etc/hearthgate:ro")
+	if strings.Count(edge, "NET_ADMIN") != 1 || strings.Count(edge, "image: "+testImage) != 2 {
+		t.Errorf("edge compose should run one image twice and grant NET_ADMIN once:\n%s", edge)
+	}
+
+	data, err := os.ReadFile("../../docker-compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := string(data)
+	wantAll(t, "home compose", home,
+		"- ./generated/home/tunnel:/etc/hearthgate:ro", "- ./generated/home/caddy:/etc/hearthgate:ro", "- ./generated/home/stream:/etc/hearthgate:ro")
+	if strings.Count(home, "NET_ADMIN") != 1 {
+		t.Errorf("home compose should grant NET_ADMIN to the gateway only:\n%s", home)
+	}
+}
+
+// Users copy the home compose file on its own, so it must run without a
+// source checkout, and from one image: upstream pins live in the Dockerfile.
+func TestHomeComposeRunsOneImage(t *testing.T) {
 	data, err := os.ReadFile("../../docker-compose.yml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	compose := string(data)
-	for _, img := range []string{ImageWireGuard, ImageNginx, ImageCaddy} {
-		if !strings.Contains(compose, "image: "+img+"\n") {
-			t.Errorf("docker-compose.yml does not use %s", img)
-		}
+	if n := strings.Count(compose, "ghcr.io/"); n != 1 {
+		t.Errorf("docker-compose.yml names %d images; want the one behind the &image anchor", n)
+	}
+	if strings.Count(compose, "image: *image\n") != 4 || strings.Contains(compose, "sha256:") {
+		t.Errorf("every service should use the &image anchor, with no pins of its own")
 	}
 	if strings.Contains(compose, "build:") {
-		t.Error("docker-compose.yml needs a source checkout to build ctl")
+		t.Error("docker-compose.yml needs a source checkout to build")
 	}
 }
 
 // The example file is what `ctl init` hands new users, so it must always be valid.
+// Compose resolves mounts before ctl starts, so a mount that fails when the
+// user has no ~/.ssh would abort every command, including `init`. Settings
+// that only the end-to-end test needs belong in its override file.
+func TestHomeComposeHasNoInstallTraps(t *testing.T) {
+	data, err := os.ReadFile("../../docker-compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"create_host_path: false", "host.docker.internal"} {
+		if strings.Contains(string(data), bad) {
+			t.Errorf("docker-compose.yml contains %q", bad)
+		}
+	}
+}
+
 func TestExampleConfigIsValid(t *testing.T) {
 	c, err := config.Parse(ExampleConfig)
 	if err != nil {

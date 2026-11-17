@@ -38,11 +38,11 @@ Hearthgate is deliberately small. It has no web UI, no built-in login or SSO lay
 
 ## Requirements
 
-- Docker with Compose v2 on both machines
+- Docker with Compose 2.17 or newer on both machines (`docker compose version`)
 - Linux kernel 5.6+ (built-in WireGuard) on both machines
 - A VPS with a public IP, and `443/tcp`, `80/tcp` and `51820/udp` open
 - A DNS record for each hostname you publish, pointing at the VPS
-- For `ctl push`: SSH access from home to the VPS, as a user who can run `docker`
+- For `ctl deploy`: SSH access from home to the VPS, as a user who can run `docker`
 
 ## Quick start
 
@@ -51,12 +51,14 @@ On your **home server**:
 ```sh
 mkdir hearthgate && cd hearthgate
 wget https://github.com/xrvo/hearthgate/releases/latest/download/docker-compose.yml
-docker compose run --rm ctl init    # writes a starting hearthgate.yml
+docker compose run --rm ctl init     # asks four questions, then generates keys and both stacks
+docker compose up -d                 # start the home gateway
+docker compose run --rm ctl deploy   # install the edge on the VPS, wait for the tunnel, verify
 ```
 
 You can also copy [`docker-compose.yml`](docker-compose.yml) from the repository by hand. There is nothing to clone or build: the compose file pulls the published `ghcr.io/xrvo/hearthgate` image.
 
-Edit `hearthgate.yml`:
+`init` asks for the VPS's address, the SSH user to reach it as, a first hostname to publish and the home container it should reach. It writes them to `hearthgate.yml`:
 
 ```yaml
 edge:
@@ -65,37 +67,35 @@ edge:
 
 publish:
   photos.example.com: immich-server:2283   # public hostname -> home container
-
-agents:
-  beszel: beszel-agent:45876               # edge container reachable from home
 ```
 
-Then:
+`deploy` first checks that the VPS is ready: SSH works, Docker and Compose answer, nothing else holds the public ports, and DNS for each hostname points at the VPS. It then installs and starts the edge, waits for home to connect, and runs `check`. Certificates are issued automatically the first time each hostname is requested.
+
+To publish more hostnames or add [agents](#configuration), edit `hearthgate.yml` and deploy again:
 
 ```sh
-docker compose run --rm ctl init    # generate keys, render both stacks
-docker compose run --rm ctl push    # copy the edge bundle to the VPS and start it
-docker compose up -d                # start the home gateway
-docker compose run --rm ctl check   # verify tunnel, certificates and firewall
+docker compose run --rm ctl deploy   # shows a diff, asks, then updates the edge
+docker compose up -d                 # picks up the change at home
 ```
 
-Certificates are issued automatically the first time each hostname is requested.
+If `docker compose up -d` reports that the gateway did not start, `docker compose logs gateway` says why in plain words: most often the configuration has not been generated yet (run `init`), or the kernel has no WireGuard support. Where there is no terminal to ask on, `init` writes an example `hearthgate.yml` for you to edit, and a second `init` generates from it.
 
-`ctl push` signs in with your SSH agent, or with `id_ed25519`, `id_ecdsa` or `id_rsa` from `~/.ssh`. It does not read `~/.ssh/config`. If your keys live elsewhere, set `HEARTHGATE_SSH_DIR` to that directory.
+`ctl` reaches the VPS as `edge.ssh`. It signs in with your SSH agent, or with `id_ed25519`, `id_ecdsa` or `id_rsa` from `~/.ssh`. It does not read `~/.ssh/config`. If your keys live elsewhere, set `HEARTHGATE_SSH_DIR` to that directory.
 
-### Installing the edge by hand
+If it cannot connect, `ctl` says why (no key found, key not authorised on the VPS, wrong port, changed host key, Docker missing on the VPS) and lists what to try. The first time it connects it shows the VPS's host key fingerprint and remembers the key in `generated/known_hosts`.
 
-If you leave out `edge.ssh`, or `push` doesn't suit your setup, copy the bundle yourself:
+If you have no `~/.ssh` folder yet, Docker creates an empty one owned by root when `ctl` first runs. Take it back with `sudo chown "$(id -u):$(id -g)" ~/.ssh` before you make a key in it.
+
+### Installing the edge with your own ssh
+
+If you leave out `edge.ssh`, or your connection needs `~/.ssh/config`, a jump host or a password, pipe the bundle through your own `ssh`:
 
 ```sh
-scp -r generated/edge ubuntu@203.0.113.5:hearthgate
-ssh ubuntu@203.0.113.5
-cd hearthgate
-printf 'HEARTHGATE_PUID=%s\nHEARTHGATE_PGID=%s\n' "$(id -u)" "$(id -g)" > .env
-docker compose up -d
+docker compose run --rm -T ctl bundle | ssh ubuntu@203.0.113.5 \
+  'mkdir -p hearthgate && cd hearthgate && tar -xzf - && docker compose up -d --remove-orphans'
 ```
 
-Repeat this whenever `ctl apply` says the edge bundle changed.
+`ctl` prints this command, filled in for your configuration, whenever the edge needs installing by hand. Repeat it whenever `ctl apply` says the edge bundle changed. The `-T` matters: without it the archive would pass through a terminal and arrive corrupted, so `ctl bundle` stops and tells you.
 
 ## Connecting your containers
 
@@ -167,7 +167,7 @@ In the hub, add a system with host `gateway` and port `45876`. Leave the agent's
 | Key | Default | Description |
 |---|---|---|
 | `edge.address` | required | Public IP or hostname of the VPS |
-| `edge.ssh` | none | `user@host` for `ctl push` and the remote half of `ctl check` |
+| `edge.ssh` | none | `user@host` that `ctl` uses to install, control and check the edge |
 | `edge.ssh_port` | `22` | SSH port |
 | `edge.dir` | `hearthgate` | Directory for the bundle on the VPS, relative to the SSH user's home |
 | `edge.wireguard_port` | `51820` | Public UDP port for the tunnel |
@@ -182,6 +182,8 @@ In the hub, add a system with host `gateway` and port `45876`. Leave the agent's
 | `networks.mgmt` | `10.210.2.0/24` | Subnet of `hearthgate-mgmt` |
 | `networks.agents` | `10.210.3.0/24` | Subnet of `hearthgate-agents` |
 
+Docker cannot change the subnet of a network that containers are attached to. If you change one under `networks`, `ctl apply` tells you what to stop first.
+
 An agent's port is used unchanged on the tunnel and at `gateway:<port>`. Ports 80, 443 and 2019 are taken, and two agents can't share one, so give a different port where needed:
 
 ```yaml
@@ -195,8 +197,8 @@ agents:
 After any change:
 
 ```sh
-docker compose run --rm ctl apply   # shows a diff, asks, then updates the edge
-docker compose up -d                # picks up the change at home
+docker compose run --rm ctl deploy   # shows a diff, asks, then updates the edge
+docker compose up -d                 # picks up the change at home
 ```
 
 ## Commands
@@ -205,13 +207,35 @@ Run each as `docker compose run --rm ctl <command>`.
 
 | Command | What it does |
 |---|---|
-| `init` | Generates keys and renders the home and edge stacks |
+| `init` | Sets up a new project: asks for the VPS and a first hostname, writes `hearthgate.yml`, generates keys and renders both stacks |
+| `deploy` | Checks the VPS, applies pending changes, pushes the edge, waits for the tunnel and runs `check` |
 | `push` | Copies the edge bundle over SSH and starts it |
+| `bundle` | Writes the edge bundle to standard output as a `tar.gz`, for installing with your own `ssh` |
 | `apply` | Re-renders after a config change, previews the diff, and pushes the edge if it changed |
-| `check` | Tests the certificates, the tunnel handshake, and that home ports other than 443 are closed to the edge |
+| `status` | Shows whether the generated files, the edge and the tunnel are in step |
+| `edge up` / `down` / `restart` | Starts, stops or restarts the edge stack on the VPS |
+| `edge status` | Shows whether the edge is installed, running, up to date and connected |
+| `edge logs` | Shows the edge's logs; `-f` follows, `-tail N` sets the length, and `tunnel` or `proxy` picks one service |
+| `check` | Tests DNS, the certificates, the tunnel handshake, and that home ports other than 443 are closed to the edge |
 | `rotate` | Replaces the WireGuard keys on both sides |
 
-`apply` and `rotate` take `-yes` to skip the prompt and `-no-push` to leave the edge to you.
+`deploy` is `apply`, `push` and `check` in one, with a check of the VPS in front; the separate commands remain for doing one step at a time. `deploy`, `apply` and `rotate` take `-yes` to skip the prompt. `apply` and `rotate` take `-no-push` to leave the edge to you, and `deploy -wait N` sets how many seconds to wait for the tunnel (60 by default).
+
+Each command ends by listing the commands to run next. Output is coloured on a terminal; set `NO_COLOR=1` to turn that off.
+
+## Starting and stopping
+
+Each side is started and stopped from your home server:
+
+| | Home gateway | Edge (on the VPS) |
+|---|---|---|
+| Start | `docker compose up -d` | `docker compose run --rm ctl edge up` |
+| Stop | `docker compose down` | `docker compose run --rm ctl edge down` |
+| Is it working? | `docker compose ps` | `docker compose run --rm ctl status` |
+
+`edge down` asks first, because every published hostname goes offline. It stops the containers and deletes nothing, and the edge stays stopped across VPS reboots until `edge up`. These commands need `edge.ssh`; without it, run `docker compose` in the bundle directory on the VPS.
+
+`status` is the quick look: it compares the files on the edge with the ones generated at home, and reads the tunnel's last handshake. `check` does the same and also tests each certificate and probes the home firewall from the edge.
 
 ## Upgrading
 
@@ -225,14 +249,16 @@ docker compose up -d
 
 ## How it works
 
-Each side runs a WireGuard container with proxies sharing its network namespace.
+Each side runs a tunnel container, holding the WireGuard interface and the firewall, with proxies sharing its network namespace.
 
 - **Edge:** an nginx `stream` proxy passes public 443 to the home gateway with PROXY protocol, so home sees real client IPs. It also exposes each agent on the tunnel address only.
 - **Home:** Caddy terminates TLS and routes by hostname. A second nginx `stream` proxy carries hub-to-agent connections.
 - **Certificates:** Caddy uses the TLS-ALPN-01 challenge, which works through the passthrough.
 - **Firewall:** generated, default-deny, input rules only. IP forwarding is disabled in both tunnel namespaces, and neither side uses NAT.
 - **Keys:** both WireGuard key pairs are generated at home. The edge's key reaches it inside the pushed bundle.
-- **Images:** stock upstream images ([linuxserver/wireguard](https://github.com/linuxserver/docker-wireguard), Caddy, nginx) pinned by digest. The only custom code is `ctl`, a small Go program that runs one-shot and never listens on the network.
+- **Separation:** every container gets a directory holding only its own files, mounted read-only. Only the tunnel container has the WireGuard keys and the `NET_ADMIN` capability. Caddy and nginx share its network, but can neither read the keys nor change the firewall, and the firewall is loaded before the tunnel interface comes up.
+- **Image:** one image, `ghcr.io/xrvo/hearthgate`, runs every container on both sides. This repository builds it and publishes it with a build provenance attestation. It packages Caddy and nginx from their official images, pinned by digest in the [`Dockerfile`](Dockerfile), with WireGuard's `wg`, `iptables` and OpenSSH from Alpine's package repository. Alpine packages are installed when the image is built and are not pinned individually.
+- **Own code:** `ctl`, a Go program that runs one-shot and never listens on the network, and a short [shell entrypoint](image/hearthgate) that brings up the tunnel and firewall and starts each proxy.
 
 Everything `ctl` writes is in `generated/` and `.env`, plus the starting `hearthgate.yml`. Keep `generated/state.json` private and backed up: it holds the tunnel keys.
 
@@ -253,6 +279,12 @@ Everything `ctl` writes is in `generated/` and `.env`, plus the starting `hearth
 - Reach any other port, container or host on your home network
 - Change what is published or reachable
 
+**What you are trusting:** the Hearthgate image, and through it Caddy, nginx, WireGuard and Alpine. You can check that an image was built by this repository's release workflow from its source:
+
+```sh
+gh attestation verify oci://ghcr.io/xrvo/hearthgate:0.1.0 --owner xrvo
+```
+
 **Out of scope:** vulnerabilities in the apps you publish. Hearthgate keeps them on an isolated network but does not add authentication in front of them.
 
 Report security issues privately; see [SECURITY.md](SECURITY.md).
@@ -260,7 +292,7 @@ Report security issues privately; see [SECURITY.md](SECURITY.md).
 ## Limitations
 
 - **IPv4 inside the stacks.** Visitors arriving at the VPS over IPv6 are served, but home sees the VPS's Docker address in place of theirs.
-- **The tunnel endpoint is resolved once.** If `edge.address` is a hostname that can't be resolved when the gateway starts, restart the gateway once DNS works.
+- **The tunnel endpoint is resolved once,** when the gateway starts. If `edge.address` is a hostname that can't be resolved then, the gateway restarts itself until it can. If the address behind the name changes later, restart the gateway.
 - **No wildcard certificates.** Each published hostname gets its own certificate.
 - **HTTP services only.** Raw TCP and UDP publishing are on the roadmap.
 
@@ -308,10 +340,10 @@ bash tests/e2e/run.sh   # both stacks on one Docker host; needs WireGuard in the
 
 The end-to-end test checks the paths that must work and, more importantly, the ones that must not. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-To run a stack with your own build of `ctl`, give the image the name `docker-compose.yml` uses, so Compose finds it locally and does not pull the release:
+To run a stack with your own build, give the image the name `docker-compose.yml` uses, so Compose finds it locally and does not pull the release:
 
 ```sh
-docker build -t "$(sed -n 's/.*image: \(ghcr.io\/xrvo\/hearthgate:.*\)/\1/p' docker-compose.yml)" .
+docker build -t "$(sed -n 's/^x-image: &image //p' docker-compose.yml)" .
 ```
 
 ## License

@@ -34,7 +34,7 @@ Out of scope, because the design accepts them (see the README's security model):
 - the edge dropping, delaying or observing the metadata of traffic
 - the edge forging the client address that home logs
 - the edge returning false data from agents
-- vulnerabilities in the apps you publish, or in upstream images, unless Hearthgate's configuration makes them reachable where they otherwise would not be
+- vulnerabilities in the apps you publish, or in the upstream software the image packages, unless Hearthgate's configuration makes them reachable where they otherwise would not be
 
 ## Supported versions
 

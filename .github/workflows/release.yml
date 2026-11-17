@@ -22,9 +22,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: docker-compose.yml names this release
         run: |
-          want="image: ghcr.io/$GITHUB_REPOSITORY:${GITHUB_REF_NAME#v}"
-          grep -qxF "    $want" docker-compose.yml || {
-            echo "::error file=docker-compose.yml::expected the ctl service to use '$want'"
+          want="x-image: &image ghcr.io/$GITHUB_REPOSITORY:${GITHUB_REF_NAME#v}"
+          grep -qxF "$want" docker-compose.yml || {
+            echo "::error file=docker-compose.yml::expected the line '$want'"
             exit 1
           }
 

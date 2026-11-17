@@ -1,89 +1,69 @@
 # Hearthgate home stack. Save this file in a directory of its own, then run
-# `docker compose run --rm ctl init` before `up`.
-#
-# The gateway's three containers share one network namespace: the WireGuard
-# tunnel, Caddy (TLS and HTTP routing) and a stream proxy (hub-to-agent
-# connections). Image references must match internal/render/render.go.
+# `docker compose run --rm ctl init`.
 name: hearthgate
 
+# Every container runs this one image. To upgrade, replace this file with the
+# new release's and run `docker compose run --rm ctl deploy`.
+x-image: &image ghcr.io/xrvo/hearthgate:0.1.0
+
 services:
+  # The WireGuard tunnel and the firewall. The two services below share its
+  # network, but not its privileges or its keys.
   gateway:
-    image: linuxserver/wireguard:1.0.20260223-r0-ls130@sha256:10db56ad834f94541307d5dfdbe87370e26d155bb341a5bf65789f970f24ab5c
-    cap_add: [NET_ADMIN]
-    environment:
-      PUID: "${HEARTHGATE_PUID:-1000}"
-      PGID: "${HEARTHGATE_PGID:-1000}"
-      TZ: Etc/UTC
-      # Changes whenever a generated file changes, so `up -d` recreates the gateway.
-      HEARTHGATE_CONFIG_HASH: "${HEARTHGATE_CONFIG_HASH:-}"
+    image: *image
+    command: tunnel
+    cap_add: [NET_ADMIN]            # to create the tunnel and firewall inside this container
     sysctls:
-      net.ipv4.ip_forward: "0"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      net.ipv4.ip_forward: "0"      # nothing is routed between the tunnel and your networks
+    environment:
+      HEARTHGATE_CONFIG_HASH: "${HEARTHGATE_CONFIG_HASH:-}"   # restarts the stack when the configuration changes
     volumes:
-      - ./generated/home/wireguard:/config
+      - ./generated/home/tunnel:/etc/hearthgate:ro
     networks:
       dmz:
         ipv4_address: "${HEARTHGATE_DMZ_IP:-10.210.1.2}"
       mgmt:
         ipv4_address: "${HEARTHGATE_MGMT_IP:-10.210.2.2}"
-    healthcheck:
-      # Healthy only once the tunnel interface exists and the firewall is loaded.
-      test: ["CMD-SHELL", "ip link show wg0 >/dev/null 2>&1 && iptables -S INPUT 2>/dev/null | grep -q -- '-P INPUT DROP'"]
-      interval: 5s
-      timeout: 3s
-      retries: 12
-      start_period: 10s
     restart: unless-stopped
 
+  # TLS and HTTP routing to the apps you publish.
   caddy:
-    image: caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
+    image: *image
+    command: caddy
     network_mode: "service:gateway"
-    depends_on:
+    depends_on: &after-gateway
       gateway:
-        condition: service_healthy
+        condition: service_healthy   # the firewall is loaded
         restart: true
-    environment:
-      HEARTHGATE_CONFIG_HASH: "${HEARTHGATE_CONFIG_HASH:-}"
     volumes:
-      - ./generated/home/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./generated/home/caddy:/etc/hearthgate:ro
       - caddy-data:/data
-      - caddy-config:/config
     restart: unless-stopped
 
+  # Connections from your monitoring hubs to agents on the edge.
   stream:
-    image: nginx:1.30.6-alpine@sha256:901e593c95dc85f5a729f5765516321366ef4ac401821431d408897e95287d0a
+    image: *image
+    command: nginx
     network_mode: "service:gateway"
-    depends_on:
-      gateway:
-        condition: service_healthy
-        restart: true
-    environment:
-      HEARTHGATE_CONFIG_HASH: "${HEARTHGATE_CONFIG_HASH:-}"
+    depends_on: *after-gateway
     volumes:
-      - ./generated/home/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./generated/home/stream:/etc/hearthgate:ro
     restart: unless-stopped
 
-  # One-shot tool: docker compose run --rm ctl <init|apply|push|check|rotate>
-  # The release workflow checks that this tag is the release being published.
+  # One-shot tool: docker compose run --rm ctl <command>
   ctl:
     profiles: [tools]
-    image: ghcr.io/xrvo/hearthgate:0.1.0
-    working_dir: /work
+    image: *image
     network_mode: bridge
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     environment:
+      HEARTHGATE_IMAGE: *image      # the edge runs the same image
       SSH_AUTH_SOCK: /ssh-agent
+      HEARTHGATE_SSH_DIR_HOST: "${HEARTHGATE_SSH_DIR:-${HOME:-.}/.ssh}"
+      NO_COLOR: "${NO_COLOR:-}"
     volumes:
       - .:/work
-      # Used by `push` and `check` to reach the edge. Keys are read, never written.
-      - type: bind
-        source: "${HEARTHGATE_SSH_DIR:-${HOME:-.}/.ssh}"
-        target: /ssh
-        read_only: true
-        bind:
-          create_host_path: false
+      # How ctl reaches the edge: your SSH keys, read-only, and your SSH agent.
+      - "${HEARTHGATE_SSH_DIR:-${HOME:-.}/.ssh}:/ssh:ro"
       - "${SSH_AUTH_SOCK:-/dev/null}:/ssh-agent"
 
 networks:
@@ -102,4 +82,3 @@ networks:
 
 volumes:
   caddy-data:   # certificates and their private keys; these never leave home
-  caddy-config:
