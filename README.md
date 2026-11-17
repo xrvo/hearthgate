@@ -13,14 +13,7 @@ Hearthgate turns that around. The VPS is a dumb pipe that forwards encrypted tra
 | Can it change what's exposed? | Yes | No, config lives at home |
 | What can it reach at home? | Whatever it's configured to | One port: the gateway's 443 |
 
-```
-                     cloud edge (low trust)              home (high trust)
-Internet ──443──▶  ┌──────────────────────┐   WireGuard   ┌─────────────────────┐
-                   │ TCP passthrough only │ ════════════▶ │ gateway: TLS + HTTP │──▶ your apps
-                   │ no certs, no config  │ ◀──────────── │ firewall, config    │
-                   │ agents ◀─────────────│  home dials   │ monitoring hubs     │
-                   └──────────────────────┘     out       └─────────────────────┘
-```
+![Visitors connect to the low-trust cloud edge on port 443. The edge passes the TCP stream, still encrypted, through a WireGuard tunnel that the home gateway dialled. The high-trust home gateway terminates TLS and routes to your apps. Monitoring hubs at home pull from agents on the edge.](docs/architecture.svg)
 
 > **Status:** early release. Both stacks are covered by an end-to-end test, but the project is new: read the [security model](#security-model) and run `ctl check` before you rely on it.
 
