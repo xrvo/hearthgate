@@ -31,6 +31,7 @@ func TestClassify(t *testing.T) {
 		{127, "bash: line 5: docker: command not found", problemNoDocker},
 		{1, "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock", problemDockerDenied},
 		{1, "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?", problemDockerDown},
+		{1, " Container hearthgate-edge-tunnel-1 Error dependency tunnel failed to start\ndependency failed to start: container hearthgate-edge-tunnel-1 is unhealthy", problemUnhealthy},
 		{2, "sh: 1: cd: can't cd to hearthgate", problemNotInstalled},
 		{1, "bash: line 1: cd: hearthgate: No such file or directory", problemNotInstalled},
 		{1, "no configuration file provided: not found", problemNotInstalled},
@@ -108,7 +109,7 @@ func TestLineWriter(t *testing.T) {
 }
 
 func TestInstallScriptQuoting(t *testing.T) {
-	if s := InstallScript("hearthgate"); strings.Contains(s, "'") || !strings.HasPrefix(s, "mkdir -p hearthgate && cd hearthgate && tar -xzf - && printf ") {
+	if s := InstallScript("hearthgate"); strings.Contains(s, "'") || s != "mkdir -p hearthgate && cd hearthgate && tar -xzf - && docker compose up -d --remove-orphans" {
 		t.Errorf("install script = %q", s)
 	}
 }
@@ -209,6 +210,7 @@ func TestExplainOtherProblems(t *testing.T) {
 		problemTooManyKeys:    {"too many keys", "ssh-add -D"},
 		problemClosed:         {"closed it before signing in", "fail2ban"},
 		problemNoCompose:      {"no Compose plugin", "docker-compose-plugin"},
+		problemUnhealthy:      {"tunnel container did not come up", "ctl edge logs tunnel", "WireGuard"},
 		problemNotInstalled:   {"not installed on vps.example yet", "ctl push", "edge.dir"},
 		problemOldCompose:     {"too old", "2.17"},
 		problemSubnetOverlap:  {"overlapping address range", "networks.agents"},

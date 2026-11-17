@@ -34,7 +34,7 @@ WORK_MOUNT=$(hostpath "$WORK")
 
 home() { (cd "$WORK" && docker compose -p hearthgate-e2e "$@"); }
 edge() { (cd "$WORK/generated/edge" && docker compose -p hearthgate-e2e-edge "$@"); }
-ctl()  { docker run --rm --add-host host.docker.internal:host-gateway -v "$WORK_MOUNT:/work" -v "$WORK_MOUNT/edgekeys:/ssh:ro" hearthgate-ctl:e2e "$@"; }
+ctl()  { docker run --rm --add-host host.docker.internal:host-gateway -v "$WORK_MOUNT:/work" -v "$WORK_MOUNT/edgekeys:/ssh:ro" -e HEARTHGATE_IMAGE=hearthgate:e2e hearthgate:e2e "$@"; }
 
 # teardown removes everything a run creates. It works by project name, so it
 # also clears what an earlier, interrupted or KEEP=1 run left behind.
@@ -67,10 +67,12 @@ says() { if echo "$3" | grep -qF -- "$2"; then pass "$1"; else fail "$1"; echo "
 # refuse <description> <command...>: the command must fail.
 refuse() { local d=$1; shift; if "$@" >/dev/null 2>&1; then fail "$d"; else pass "$d"; fi; }
 
-echo "== Building ctl and rendering the configuration"
+echo "== Building the image and rendering the configuration"
 teardown
 mkdir -p "$WORK/edgekeys"
 cp "$ROOT/docker-compose.yml" "$ROOT/tests/e2e/docker-compose.override.yml" "$WORK/"
+# Run the image built here in place of the published one.
+sed -i "s|ghcr.io/[^ ]*|hearthgate:e2e|" "$WORK/docker-compose.yml"
 cat > "$WORK/hearthgate.yml" <<EOF
 edge:
   address: host.docker.internal
@@ -86,7 +88,7 @@ agents:
 tls:
   ca: internal
 EOF
-docker build -q -t hearthgate-ctl:e2e "$(hostpath "$ROOT")" >/dev/null
+docker build -q -t hearthgate:e2e "$(hostpath "$ROOT")" >/dev/null
 ctl init
 
 # Home first, as the quick start has it: the gateway must come up and keep
@@ -164,6 +166,17 @@ tunnel_id=$(edge ps -q tunnel)
 tunnel_agents_ip=$(docker inspect -f '{{(index .NetworkSettings.Networks "hearthgate-agents").IPAddress}}' "$tunnel_id")
 refuse "edge agents cannot reach the agent listener (it is tunnel-only)" on hearthgate-agents nc -z -w 3 "$tunnel_agents_ip" "$AGENT_PORT"
 
+# The proxies share a tunnel's network. They must not share its keys or its
+# right to change the firewall.
+refuse "caddy cannot read the home tunnel's keys" home exec -T caddy sh -c 'ls /etc/hearthgate | grep -q wg0'
+refuse "the home stream proxy cannot read the tunnel's keys" home exec -T stream sh -c 'ls /etc/hearthgate | grep -q wg0'
+refuse "the edge proxy cannot read the edge tunnel's keys" edge exec -T proxy sh -c 'ls /etc/hearthgate | grep -q wg0'
+refuse "caddy cannot open the home firewall" home exec -T caddy iptables -P INPUT ACCEPT
+refuse "the home stream proxy cannot open the home firewall" home exec -T stream iptables -P INPUT ACCEPT
+refuse "the edge proxy cannot open the edge firewall" edge exec -T proxy iptables -P INPUT ACCEPT
+refuse "the home tunnel's configuration is read-only inside it" home exec -T gateway sh -c 'echo x >> /etc/hearthgate/firewall.sh'
+expect "the home gateway is still healthy and default-deny afterwards" home exec -T gateway hearthgate healthy
+
 for side in home edge; do
 	if [ "$side" = home ]; then fwd=$(home exec -T gateway cat /proc/sys/net/ipv4/ip_forward); else fwd=$(edge exec -T tunnel cat /proc/sys/net/ipv4/ip_forward); fi
 	if [ "$(echo "$fwd" | tr -d '\r')" = 0 ]; then pass "$side namespace does not forward packets"; else fail "$side namespace does not forward packets"; fi
@@ -211,7 +224,7 @@ home start caddy >/dev/null 2>&1
 [ "$down_rc" != 0 ] && pass "ctl check fails while the gateway's TLS listener is down" || fail "ctl check fails while the gateway's TLS listener is down"
 says "the failure says where to look" "no TLS answer came back from home" "$down_out"
 says "and what to run" "docker compose logs caddy" "$down_out"
-expect "ctl apply reports nothing to change" sh -c "docker run --rm -v '$WORK_MOUNT:/work' hearthgate-ctl:e2e apply | grep -q 'Nothing to change'"
+expect "ctl apply reports nothing to change" sh -c "docker run --rm -e HEARTHGATE_IMAGE=hearthgate:e2e -v '$WORK_MOUNT:/work' hearthgate:e2e apply | grep -q 'Nothing to change'"
 
 echo "== ctl edge: stop, inspect and restart the running edge"
 expect "edge logs shows the proxy's log" ctl edge logs -tail 5 proxy
@@ -236,6 +249,33 @@ else
 	echo "--- tunnel logs"; edge logs --tail 20 tunnel || true
 	echo "--- proxy logs"; edge logs --tail 20 proxy || true
 fi
+
+echo "== A change at home reaches the running gateway"
+sed -i '/^  app.e2e.test: e2e-app:80$/a\  second.e2e.test: e2e-app:80' "$WORK/hearthgate.yml"
+apply_out=$(ctl apply -yes 2>&1) && apply_rc=0 || apply_rc=$?
+[ "$apply_rc" = 0 ] && pass "ctl apply accepts a second hostname" || { fail "ctl apply accepts a second hostname"; echo "$apply_out"; }
+if echo "$apply_out" | grep -q "Connecting to"; then fail "a home-only change leaves the edge alone"; else pass "a home-only change leaves the edge alone"; fi
+home up -d gateway caddy stream
+fetch2() { curl -sk --max-time 10 --resolve "second.e2e.test:$HTTPS_PORT:127.0.0.1" "https://second.e2e.test:$HTTPS_PORT/"; }
+body=""
+for _ in $(seq 1 45); do
+	body=$(fetch2 || true)
+	echo "$body" | grep -q '^Hostname:' && break
+	sleep 2
+done
+if echo "$body" | grep -q '^Hostname:'; then
+	pass "the new hostname is served after docker compose up -d"
+else
+	fail "the new hostname is served after docker compose up -d"
+	echo "--- gateway logs"; home logs --tail 20 gateway || true
+	echo "--- caddy logs"; home logs --tail 20 caddy || true
+fi
+expect "the first hostname still answers" sh -c "curl -sk --max-time 10 --resolve 'app.e2e.test:$HTTPS_PORT:127.0.0.1' 'https://app.e2e.test:$HTTPS_PORT/' | grep -q '^Hostname:'"
+
+echo "== The image explains a missing configuration"
+bare_out=$(docker run --rm hearthgate:e2e caddy 2>&1) && bare_rc=0 || bare_rc=$?
+[ "$bare_rc" != 0 ] && pass "a role with no configuration stops" || fail "a role with no configuration stops"
+says "it says what to run" "docker compose run --rm ctl init" "$bare_out"
 
 echo "== ctl push over SSH (to a throwaway SSH server with a stand-in docker command)"
 PUSH="$WORK/push"
@@ -277,7 +317,7 @@ for _ in $(seq 1 30); do
 done
 pushctl() {
 	docker run --rm --add-host host.docker.internal:host-gateway \
-		-v "$(hostpath "$PUSH"):/work" -v "$(hostpath "$PUSH/keys"):/ssh:ro" hearthgate-ctl:e2e "$@"
+		-v "$(hostpath "$PUSH"):/work" -v "$(hostpath "$PUSH/keys"):/ssh:ro" hearthgate:e2e "$@"
 }
 pushctl init >/dev/null
 push_out=$(pushctl push 2>&1) && push_rc=0 || push_rc=$?
@@ -288,12 +328,11 @@ else
 	echo "$push_out"
 fi
 remote() { docker exec -u tester e2e-sshd sh -c "$1"; }
-expect "push installed the whole bundle" remote 'cd ~/hearthgate && test -f docker-compose.yml -a -f nginx.conf -a -f wireguard/firewall.sh -a -f wireguard/wg_confs/wg0.conf'
-expect "pushed WireGuard config is private (mode 600)" remote 'test "$(stat -c %a ~/hearthgate/wireguard/wg_confs/wg0.conf)" = 600'
-expect "push recorded the SSH user for the tunnel container" remote 'grep -q "^HEARTHGATE_PUID=$(id -u)$" ~/hearthgate/.env'
+expect "push installed the whole bundle" remote 'cd ~/hearthgate && test -f docker-compose.yml -a -f proxy/nginx.conf -a -f tunnel/firewall.sh -a -f tunnel/tunnel.env -a -f tunnel/wg0.conf'
+expect "pushed WireGuard config is private (mode 600)" remote 'test "$(stat -c %a ~/hearthgate/tunnel/wg0.conf)" = 600'
 expect "push started the edge stack" remote 'grep -qx "compose up -d --remove-orphans" /tmp/docker-calls'
 says "push shows the edge's own output as it arrives" "edge | compose up -d --remove-orphans" "$push_out"
-says "push says what it copied and what to run next" "Copied 4 files to tester@host.docker.internal:hearthgate" "$push_out"
+says "push says what it copied and what to run next" "Copied 5 files to tester@host.docker.internal:hearthgate" "$push_out"
 up_out=$(pushctl edge up 2>&1 || true)
 says "edge up starts the installed stack" "edge | compose up -d --remove-orphans" "$up_out"
 
@@ -310,12 +349,12 @@ deploy_out=$(pushctl deploy -yes -wait 2 2>&1) && deploy_rc=0 || deploy_rc=$?
 says "deploy checks Docker and Compose on the VPS first" "Docker 29.0.0 and Compose 2.40.0 on the VPS" "$deploy_out"
 says "deploy finds the public ports free" "ports 443/tcp, 80/tcp, 51820/udp are free on the VPS" "$deploy_out"
 says "deploy warns that the hostname has no DNS record" "warn  DNS: app.e2e.test does not resolve yet" "$deploy_out"
-says "deploy pushes the bundle" "Copied 4 files" "$deploy_out"
+says "deploy pushes the bundle" "Copied 5 files" "$deploy_out"
 expect "deploy started the edge stack" remote 'grep -qx "compose up -d --remove-orphans" /tmp/docker-calls'
 says "deploy reports that home never connected" "Home has not connected." "$deploy_out"
 [ "$deploy_rc" != 0 ] && pass "deploy fails when the tunnel does not come up" || fail "deploy fails when the tunnel does not come up"
 
-expect "pushed bundle is identical to the rendered one" sh -c "docker exec -u tester e2e-sshd cat /home/tester/hearthgate/nginx.conf | cmp -s - '$PUSH/generated/edge/nginx.conf'"
+expect "pushed bundle is identical to the rendered one" sh -c "docker exec -u tester e2e-sshd cat /home/tester/hearthgate/proxy/nginx.conf | cmp -s - '$PUSH/generated/edge/proxy/nginx.conf'"
 
 
 echo "== SSH failures are explained"
@@ -325,7 +364,7 @@ again=$(pushctl push 2>&1 || true)
 if echo "$again" | grep -q 'Fingerprint\|Permanently added'; then fail "a known host key is not announced again"; echo "$again"; else pass "a known host key is not announced again"; fi
 
 nokeys() { docker run --rm --add-host host.docker.internal:host-gateway -e HEARTHGATE_SSH_DIR_HOST=/home/me/.ssh \
-	-v "$(hostpath "$PUSH"):/work" -v "$(hostpath "$PUSH/empty"):/ssh:ro" hearthgate-ctl:e2e "$@"; }
+	-v "$(hostpath "$PUSH"):/work" -v "$(hostpath "$PUSH/empty"):/ssh:ro" hearthgate:e2e "$@"; }
 mkdir -p "$PUSH/empty"
 out=$(nokeys push 2>&1) && rc=0 || rc=$?
 nokeys_out=$out
@@ -352,13 +391,13 @@ expect "push works again once the old host key is deleted" pushctl push
 echo "== ctl bundle, installed through a plain ssh pipe"
 remote 'rm -rf ~/hearthgate /tmp/docker-calls'
 install=$(echo "$nokeys_out" | sed -n "s/.*| ssh [^']*'\\(.*\\)'\$/\\1/p" || true)
-refuse "ctl bundle refuses to write the archive to a terminal" docker run --rm -t -v "$(hostpath "$PUSH"):/work" hearthgate-ctl:e2e bundle
+refuse "ctl bundle refuses to write the archive to a terminal" docker run --rm -t -v "$(hostpath "$PUSH"):/work" hearthgate:e2e bundle
 if [ -n "$install" ] && pushctl bundle | docker exec -i -u tester e2e-sshd sh -c "cd ~ && $install" >/dev/null 2>&1; then
 	pass "the manual install command that ctl prints runs on the edge"
 else
 	fail "the manual install command that ctl prints runs on the edge (command: '$install')"
 fi
-expect "bundle installed the whole bundle and started the stack" remote 'cd ~/hearthgate && test -f docker-compose.yml -a -f wireguard/wg_confs/wg0.conf && grep -q "^HEARTHGATE_PUID=$(id -u)$" .env && grep -qx "compose up -d --remove-orphans" /tmp/docker-calls'
+expect "bundle installed the whole bundle and started the stack" remote 'cd ~/hearthgate && test -f docker-compose.yml -a -f tunnel/wg0.conf && grep -qx "compose up -d --remove-orphans" /tmp/docker-calls'
 
 echo "== Failures on the edge and on the way to it are explained"
 docker exec e2e-sshd rm /usr/local/bin/docker
@@ -374,7 +413,7 @@ says "a failed push says how to retry" "docker compose run --rm -T ctl bundle" "
 echo "== ctl init asks its questions and sets a project up in one run"
 WIZ="$WORK/wizard"
 mkdir -p "$WIZ"
-wiz_out=$(printf '198.51.100.7\nroot\nphotos.e2e.test\napp:80\n' | docker run --rm -i -v "$(hostpath "$WIZ"):/work" hearthgate-ctl:e2e init 2>&1 || true)
+wiz_out=$(printf '198.51.100.7\nroot\nphotos.e2e.test\napp:80\n' | docker run --rm -i -v "$(hostpath "$WIZ"):/work" hearthgate:e2e init 2>&1 || true)
 says "init generates the keys from the answers" "Generated the tunnel keys" "$wiz_out"
 says "init points at deploy" "docker compose run --rm ctl deploy" "$wiz_out"
 expect "init wrote the answers to hearthgate.yml" grep -q "ssh: root@198.51.100.7" "$WIZ/hearthgate.yml"
@@ -383,7 +422,7 @@ echo "== The home stack does not need an SSH folder to start ctl"
 NOSSH="$WORK/nossh"
 mkdir -p "$NOSSH/home"
 cp "$ROOT/docker-compose.yml" "$NOSSH/"
-sed -i "s|image: ghcr.io/.*|image: hearthgate-ctl:e2e|" "$NOSSH/docker-compose.yml"
+sed -i "s|ghcr.io/[^ ]*|hearthgate:e2e|" "$NOSSH/docker-compose.yml"
 if (cd "$NOSSH" && HOME="$NOSSH/home" SSH_AUTH_SOCK= docker compose -p hearthgate-e2e-nossh run --rm -T ctl init 2>&1 | grep -q 'Wrote a starting hearthgate.yml'); then
 	pass "ctl init runs for a user with no ~/.ssh and no agent"
 else

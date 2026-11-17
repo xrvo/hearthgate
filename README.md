@@ -78,7 +78,7 @@ docker compose run --rm ctl deploy   # shows a diff, asks, then updates the edge
 docker compose up -d                 # picks up the change at home
 ```
 
-Run `init` before the first `docker compose up`. If you start the stack first, Docker creates empty directories where the generated files belong; `init` notices and offers to remove them. Where there is no terminal to ask on, `init` writes an example `hearthgate.yml` for you to edit, and a second `init` generates from it.
+If `docker compose up -d` reports that the gateway did not start, `docker compose logs gateway` says why in plain words: most often the configuration has not been generated yet (run `init`), or the kernel has no WireGuard support. Where there is no terminal to ask on, `init` writes an example `hearthgate.yml` for you to edit, and a second `init` generates from it.
 
 `ctl` reaches the VPS as `edge.ssh`. It signs in with your SSH agent, or with `id_ed25519`, `id_ecdsa` or `id_rsa` from `~/.ssh`. It does not read `~/.ssh/config`. If your keys live elsewhere, set `HEARTHGATE_SSH_DIR` to that directory.
 
@@ -92,7 +92,7 @@ If you leave out `edge.ssh`, or your connection needs `~/.ssh/config`, a jump ho
 
 ```sh
 docker compose run --rm -T ctl bundle | ssh ubuntu@203.0.113.5 \
-  'mkdir -p hearthgate && cd hearthgate && tar -xzf - && printf "HEARTHGATE_PUID=%s\nHEARTHGATE_PGID=%s\n" "$(id -u)" "$(id -g)" > .env && docker compose up -d --remove-orphans'
+  'mkdir -p hearthgate && cd hearthgate && tar -xzf - && docker compose up -d --remove-orphans'
 ```
 
 `ctl` prints this command, filled in for your configuration, whenever the edge needs installing by hand. Repeat it whenever `ctl apply` says the edge bundle changed. The `-T` matters: without it the archive would pass through a terminal and arrive corrupted, so `ctl bundle` stops and tells you.
@@ -249,14 +249,16 @@ docker compose up -d
 
 ## How it works
 
-Each side runs a WireGuard container with proxies sharing its network namespace.
+Each side runs a tunnel container, holding the WireGuard interface and the firewall, with proxies sharing its network namespace.
 
 - **Edge:** an nginx `stream` proxy passes public 443 to the home gateway with PROXY protocol, so home sees real client IPs. It also exposes each agent on the tunnel address only.
 - **Home:** Caddy terminates TLS and routes by hostname. A second nginx `stream` proxy carries hub-to-agent connections.
 - **Certificates:** Caddy uses the TLS-ALPN-01 challenge, which works through the passthrough.
 - **Firewall:** generated, default-deny, input rules only. IP forwarding is disabled in both tunnel namespaces, and neither side uses NAT.
 - **Keys:** both WireGuard key pairs are generated at home. The edge's key reaches it inside the pushed bundle.
-- **Images:** stock upstream images ([linuxserver/wireguard](https://github.com/linuxserver/docker-wireguard), Caddy, nginx) pinned by digest. The only custom code is `ctl`, a small Go program that runs one-shot and never listens on the network.
+- **Separation:** every container gets a directory holding only its own files, mounted read-only. Only the tunnel container has the WireGuard keys and the `NET_ADMIN` capability. Caddy and nginx share its network, but can neither read the keys nor change the firewall, and the firewall is loaded before the tunnel interface comes up.
+- **Image:** one image, `ghcr.io/xrvo/hearthgate`, runs every container on both sides. This repository builds it and publishes it with a build provenance attestation. It packages Caddy and nginx from their official images, pinned by digest in the [`Dockerfile`](Dockerfile), with WireGuard's `wg`, `iptables` and OpenSSH from Alpine's package repository. Alpine packages are installed when the image is built and are not pinned individually.
+- **Own code:** `ctl`, a Go program that runs one-shot and never listens on the network, and a short [shell entrypoint](image/hearthgate) that brings up the tunnel and firewall and starts each proxy.
 
 Everything `ctl` writes is in `generated/` and `.env`, plus the starting `hearthgate.yml`. Keep `generated/state.json` private and backed up: it holds the tunnel keys.
 
@@ -277,6 +279,12 @@ Everything `ctl` writes is in `generated/` and `.env`, plus the starting `hearth
 - Reach any other port, container or host on your home network
 - Change what is published or reachable
 
+**What you are trusting:** the Hearthgate image, and through it Caddy, nginx, WireGuard and Alpine. You can check that an image was built by this repository's release workflow from its source:
+
+```sh
+gh attestation verify oci://ghcr.io/xrvo/hearthgate:0.1.0 --owner xrvo
+```
+
 **Out of scope:** vulnerabilities in the apps you publish. Hearthgate keeps them on an isolated network but does not add authentication in front of them.
 
 Report security issues privately; see [SECURITY.md](SECURITY.md).
@@ -284,7 +292,7 @@ Report security issues privately; see [SECURITY.md](SECURITY.md).
 ## Limitations
 
 - **IPv4 inside the stacks.** Visitors arriving at the VPS over IPv6 are served, but home sees the VPS's Docker address in place of theirs.
-- **The tunnel endpoint is resolved once.** If `edge.address` is a hostname that can't be resolved when the gateway starts, restart the gateway once DNS works.
+- **The tunnel endpoint is resolved once,** when the gateway starts. If `edge.address` is a hostname that can't be resolved then, the gateway restarts itself until it can. If the address behind the name changes later, restart the gateway.
 - **No wildcard certificates.** Each published hostname gets its own certificate.
 - **HTTP services only.** Raw TCP and UDP publishing are on the roadmap.
 
@@ -332,10 +340,10 @@ bash tests/e2e/run.sh   # both stacks on one Docker host; needs WireGuard in the
 
 The end-to-end test checks the paths that must work and, more importantly, the ones that must not. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-To run a stack with your own build of `ctl`, give the image the name `docker-compose.yml` uses, so Compose finds it locally and does not pull the release:
+To run a stack with your own build, give the image the name `docker-compose.yml` uses, so Compose finds it locally and does not pull the release:
 
 ```sh
-docker build -t "$(sed -n 's/.*image: \(ghcr.io\/xrvo\/hearthgate:.*\)/\1/p' docker-compose.yml)" .
+docker build -t "$(sed -n 's/^x-image: &image //p' docker-compose.yml)" .
 ```
 
 ## License

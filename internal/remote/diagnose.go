@@ -237,6 +237,7 @@ const (
 	problemSubnetOverlap
 	problemNetworkBusy
 	problemNotInstalled
+	problemUnhealthy
 )
 
 var (
@@ -299,6 +300,8 @@ func classify(code int, output string) problem {
 		return problemSubnetOverlap
 	case has("has active endpoints"):
 		return problemNetworkBusy
+	case has("dependency failed to start", "is unhealthy"):
+		return problemUnhealthy
 	}
 	return problemUnknown
 }
@@ -395,6 +398,13 @@ func (c *Client) explain(p problem, output string) string {
 		line("What to try:")
 		line("  - install and start it: docker compose run --rm ctl push")
 		line("  - if it is installed somewhere else, set edge.dir in hearthgate.yml to that directory")
+
+	case problemUnhealthy:
+		line("The edge's tunnel container did not come up on %s, so the rest of the stack was not started.", c.host())
+		line("The files were copied; only the start failed.")
+		line("What to try:")
+		line("  - read why, in its own words: docker compose run --rm ctl edge logs tunnel")
+		line("  - the usual cause is a kernel without WireGuard: on the VPS, `uname -r` should show 5.6 or newer")
 
 	case problemNoCompose:
 		line("Docker on %s has no Compose plugin: `docker compose` is not a command there.", c.host())

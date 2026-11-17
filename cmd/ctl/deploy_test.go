@@ -218,7 +218,7 @@ func TestDeployStopsAtPreflight(t *testing.T) {
 	if !strings.Contains(out, "ok    DNS: photos.example.net points at the edge") {
 		t.Errorf("preflight did not report DNS:\n%s", out)
 	}
-	if strings.Contains(read(t, dir, "generated/home/Caddyfile"), "3000") {
+	if strings.Contains(read(t, dir, "generated/home/caddy/Caddyfile"), "3000") {
 		t.Error("deploy wrote files although the preflight failed")
 	}
 }

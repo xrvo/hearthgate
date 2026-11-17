@@ -46,57 +46,6 @@ func placeholders(data []byte) []string {
 	return out
 }
 
-// strayDirs returns the paths where a rendered file belongs but a directory
-// exists. Docker creates a directory for a bind mount whose source is
-// missing, which is what `docker compose up` before `ctl init` leaves behind.
-func (a *app) strayDirs(files render.Files) []string {
-	var out []string
-	for _, p := range files.Paths() {
-		if info, err := os.Stat(filepath.Join(a.dir, filepath.FromSlash(p))); err == nil && info.IsDir() {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// clearStrayDirs removes those directories, after asking, so the files can be
-// written. It only ever removes empty ones.
-func (a *app) clearStrayDirs(files render.Files, yes bool) error {
-	dirs := a.strayDirs(files)
-	if len(dirs) == 0 {
-		return nil
-	}
-	fmt.Fprintln(a.out, "These should be files, but there are directories in their place:")
-	for _, d := range dirs {
-		fmt.Fprintf(a.out, "  %s\n", d)
-	}
-	fmt.Fprintln(a.out, "Docker creates them when `docker compose up` runs before the files exist.")
-	for _, d := range dirs {
-		entries, err := os.ReadDir(filepath.Join(a.dir, filepath.FromSlash(d)))
-		if err != nil {
-			return err
-		}
-		if len(entries) > 0 {
-			return fmt.Errorf("%s is not empty, so ctl will not remove it. Move it out of the way and run this command again", d)
-		}
-	}
-	if !yes {
-		ok, err := a.confirm("Remove these empty directories and continue?")
-		if errors.Is(err, errNoAnswer) {
-			return fmt.Errorf("there is no terminal to ask on. Remove the directories yourself and run this command again:\n  sudo rmdir %s", strings.Join(dirs, " "))
-		}
-		if !ok {
-			return errCancelled
-		}
-	}
-	for _, d := range dirs {
-		if err := os.Remove(filepath.Join(a.dir, filepath.FromSlash(d))); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // networkNotes warns about subnet changes. Docker cannot change the subnet of
 // a network in place, and cannot replace one that containers are attached to.
 func networkNotes(changes []change) []string {

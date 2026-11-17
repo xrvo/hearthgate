@@ -20,14 +20,6 @@ import (
 	"github.com/xrvo/hearthgate/internal/state"
 )
 
-// Images used by both stacks, pinned by tag and digest. The home stack's
-// docker-compose.yml must use the same references; a test enforces that.
-const (
-	ImageWireGuard = "linuxserver/wireguard:1.0.20260223-r0-ls130@sha256:10db56ad834f94541307d5dfdbe87370e26d155bb341a5bf65789f970f24ab5c"
-	ImageNginx     = "nginx:1.30.6-alpine@sha256:901e593c95dc85f5a729f5765516321366ef4ac401821431d408897e95287d0a"
-	ImageCaddy     = "caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0"
-)
-
 // Paths of the rendered files, relative to the project directory.
 const (
 	HomeDir = "generated/home/"
@@ -83,12 +75,16 @@ type data struct {
 	Preshared               string
 	RedirectPort            string
 	EdgeHash                string
-	ImageWireGuard          string
-	ImageNginx              string
+	Image                   string
 }
 
-// Render produces every generated file for both sides.
-func Render(cfg *config.Config, st *state.State) (Files, error) {
+// Render produces every generated file for both sides. image is the
+// Hearthgate image the edge stack runs; the home stack's compose file names
+// its own.
+//
+// Each container gets a directory of its own, mounted read-only, so that the
+// proxies beside a tunnel cannot read its keys.
+func Render(cfg *config.Config, st *state.State, image string) (Files, error) {
 	homePub, err := keys.Public(st.HomePrivate)
 	if err != nil {
 		return nil, fmt.Errorf("home key: %w", err)
@@ -101,9 +97,8 @@ func Render(cfg *config.Config, st *state.State) (Files, error) {
 		Config:      cfg,
 		HomePrivate: st.HomePrivate, HomePublic: homePub,
 		EdgePrivate: st.EdgePrivate, EdgePublic: edgePub,
-		Preshared:      st.Preshared,
-		ImageWireGuard: ImageWireGuard,
-		ImageNginx:     ImageNginx,
+		Preshared: st.Preshared,
+		Image:     image,
 	}
 	if cfg.HTTPSPort != 443 {
 		d.RedirectPort = ":" + strconv.Itoa(cfg.HTTPSPort)
@@ -123,19 +118,27 @@ func Render(cfg *config.Config, st *state.State) (Files, error) {
 		path, tmpl string
 		mode       fs.FileMode
 	}{
-		{HomeDir + "wireguard/wg_confs/wg0.conf", "home-wg0.conf.tmpl", 0o600},
-		{HomeDir + "wireguard/firewall.sh", "home-firewall.sh.tmpl", 0o644},
-		{HomeDir + "Caddyfile", "home-Caddyfile.tmpl", 0o644},
-		{HomeDir + "nginx.conf", "home-nginx.conf.tmpl", 0o644},
-		{EdgeDir + "wireguard/wg_confs/wg0.conf", "edge-wg0.conf.tmpl", 0o600},
-		{EdgeDir + "wireguard/firewall.sh", "edge-firewall.sh.tmpl", 0o644},
-		{EdgeDir + "nginx.conf", "edge-nginx.conf.tmpl", 0o644},
+		{HomeDir + "tunnel/wg0.conf", "home-wg0.conf.tmpl", 0o600},
+		{HomeDir + "tunnel/firewall.sh", "home-firewall.sh.tmpl", 0o644},
+		{HomeDir + "caddy/Caddyfile", "home-Caddyfile.tmpl", 0o644},
+		{HomeDir + "stream/nginx.conf", "home-nginx.conf.tmpl", 0o644},
+		{EdgeDir + "tunnel/wg0.conf", "edge-wg0.conf.tmpl", 0o600},
+		{EdgeDir + "tunnel/firewall.sh", "edge-firewall.sh.tmpl", 0o644},
+		{EdgeDir + "proxy/nginx.conf", "edge-nginx.conf.tmpl", 0o644},
 	}
 	for _, s := range steps {
 		if err := add(s.path, s.tmpl, s.mode); err != nil {
 			return nil, err
 		}
 	}
+
+	// The tunnel container's entrypoint reads its own address and its peer's
+	// from here; wg0.conf holds only what `wg setconf` accepts.
+	tunnelEnv := func(address, peer fmt.Stringer) File {
+		return File{Content: fmt.Appendf(nil, "ADDRESS=%s\nPEER=%s\n", address, peer), Mode: 0o644}
+	}
+	files[HomeDir+"tunnel/tunnel.env"] = tunnelEnv(cfg.HomeIP, cfg.EdgeIP)
+	files[EdgeDir+"tunnel/tunnel.env"] = tunnelEnv(cfg.EdgeIP, cfg.HomeIP)
 
 	// The hashes change whenever a mounted file changes, which is what makes
 	// `docker compose up -d` recreate the containers that read them.

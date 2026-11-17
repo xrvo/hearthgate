@@ -320,9 +320,6 @@ func portPattern(busy []string) string {
 // stage previews pending changes to the generated files and, once confirmed,
 // writes them. It returns what changed; nothing pending is not an error.
 func (a *app) stage(cfg *config.Config, st *state.State, files render.Files, yes, saveState bool) ([]change, error) {
-	if err := a.clearStrayDirs(files, yes); err != nil {
-		return nil, err
-	}
 	changes, err := a.pending(files)
 	if err != nil || len(changes) == 0 {
 		return nil, err

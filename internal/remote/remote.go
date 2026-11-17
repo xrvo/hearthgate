@@ -184,8 +184,6 @@ const MarkCopied = "hearthgate:copied"
 
 // Push installs the edge bundle and starts or updates the edge stack. Each
 // line the edge prints is handed to onLine as it arrives.
-// The .env it writes makes the tunnel container run as the SSH user, so the
-// bundle's files stay writable for the next push.
 func (c *Client) Push(ctx context.Context, bundle render.Files, onLine func(string)) error {
 	archive, err := Archive(bundle, time.Now())
 	if err != nil {
@@ -200,7 +198,7 @@ func unpackScript(dir string) string {
 	return fmt.Sprintf("mkdir -p %[1]s && cd %[1]s && tar -xzf -", dir)
 }
 
-const startScript = `printf "HEARTHGATE_PUID=%s\nHEARTHGATE_PGID=%s\n" "$(id -u)" "$(id -g)" > .env && docker compose up -d --remove-orphans`
+const startScript = "docker compose up -d --remove-orphans"
 
 // InstallScript is the shell command that installs a bundle archive read from
 // standard input into dir and starts the edge stack. dir must be validated.

@@ -62,10 +62,10 @@ func TestInitThenApply(t *testing.T) {
 	}
 	for _, f := range []string{
 		"generated/state.json", ".env",
-		"generated/home/Caddyfile", "generated/home/nginx.conf",
-		"generated/home/wireguard/wg_confs/wg0.conf", "generated/home/wireguard/firewall.sh",
-		"generated/edge/docker-compose.yml", "generated/edge/nginx.conf",
-		"generated/edge/wireguard/wg_confs/wg0.conf", "generated/edge/wireguard/firewall.sh",
+		"generated/home/caddy/Caddyfile", "generated/home/stream/nginx.conf",
+		"generated/home/tunnel/wg0.conf", "generated/home/tunnel/firewall.sh", "generated/home/tunnel/tunnel.env",
+		"generated/edge/docker-compose.yml", "generated/edge/proxy/nginx.conf",
+		"generated/edge/tunnel/wg0.conf", "generated/edge/tunnel/firewall.sh", "generated/edge/tunnel/tunnel.env",
 	} {
 		read(t, dir, f)
 	}
@@ -101,7 +101,7 @@ func TestInitThenApply(t *testing.T) {
 	if !strings.Contains(out, "This changes 2 generated files:") || !strings.Contains(out, "  home  2 files.") || strings.Contains(out, "  edge  ") {
 		t.Errorf("summary does not say which side changes:\n%s", out)
 	}
-	if strings.Contains(read(t, dir, "generated/home/Caddyfile"), "3000") {
+	if strings.Contains(read(t, dir, "generated/home/caddy/Caddyfile"), "3000") {
 		t.Error("declined apply still wrote files")
 	}
 
@@ -109,7 +109,7 @@ func TestInitThenApply(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "docker compose up -d") {
 		t.Errorf("accepted apply: code %d\n%s", code, out)
 	}
-	if !strings.Contains(read(t, dir, "generated/home/Caddyfile"), "immich-server:3000") {
+	if !strings.Contains(read(t, dir, "generated/home/caddy/Caddyfile"), "immich-server:3000") {
 		t.Error("accepted apply did not update the Caddyfile")
 	}
 	if !strings.Contains(out, "Next:") || !strings.Contains(out, "docker compose run --rm ctl check") {
@@ -167,54 +167,6 @@ func TestPlaceholdersMatchWholeValues(t *testing.T) {
 	}
 }
 
-// `docker compose up` before `ctl init` leaves directories where the mounted
-// files belong.
-func TestInitRepairsDirectoriesDockerCreated(t *testing.T) {
-	stray := []string{"generated/home/Caddyfile", "generated/home/nginx.conf"}
-	setup := func() string {
-		dir := project(t, testConfig)
-		for _, p := range stray {
-			os.MkdirAll(filepath.Join(dir, filepath.FromSlash(p)), 0o755)
-		}
-		return dir
-	}
-
-	dir := setup()
-	code, out := ctl(t, dir, "", "init")
-	if code == 0 || !strings.Contains(out, "sudo rmdir generated/home/Caddyfile generated/home/nginx.conf") {
-		t.Errorf("init with no terminal: code %d\n%s", code, out)
-	}
-	if code, out := ctl(t, dir, "n\n", "init"); code == 0 || !strings.Contains(out, "docker compose up") {
-		t.Errorf("declined repair: code %d\n%s", code, out)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "generated", "state.json")); err == nil {
-		t.Error("a refused repair still generated keys")
-	}
-	if code, out := ctl(t, dir, "y\n", "init"); code != 0 || !strings.Contains(read(t, dir, stray[0]), "reverse_proxy") {
-		t.Errorf("accepted repair: code %d\n%s", code, out)
-	}
-
-	// A directory with something in it is never removed.
-	dir = setup()
-	os.WriteFile(filepath.Join(dir, "generated", "home", "nginx.conf", "keep"), []byte("x"), 0o644)
-	if code, out := ctl(t, dir, "y\n", "init"); code == 0 || !strings.Contains(out, "generated/home/nginx.conf is not empty") {
-		t.Errorf("non-empty directory: code %d\n%s", code, out)
-	}
-	read(t, dir, "generated/home/nginx.conf/keep")
-
-	// After init, the same damage is repaired by apply and reported by the rest.
-	dir = project(t, testConfig)
-	ctl(t, dir, "", "init")
-	os.Remove(filepath.Join(dir, "generated", "home", "Caddyfile"))
-	os.Mkdir(filepath.Join(dir, "generated", "home", "Caddyfile"), 0o755)
-	if code, out := ctl(t, dir, "", "bundle"); code == 0 || !strings.Contains(out, "is a directory, but it should be a file. Run `ctl apply`") {
-		t.Errorf("bundle with a stray directory: code %d\n%s", code, out)
-	}
-	if code, out := ctl(t, dir, "", "apply", "-yes"); code != 0 || !strings.Contains(read(t, dir, stray[0]), "reverse_proxy") {
-		t.Errorf("apply -yes repair: code %d\n%s", code, out)
-	}
-}
-
 func TestNoTerminal(t *testing.T) {
 	dir := project(t, testConfig)
 	ctl(t, dir, "", "init")
@@ -225,7 +177,7 @@ func TestNoTerminal(t *testing.T) {
 			t.Errorf("%s with no terminal: code %d\n%s", cmd, code, out)
 		}
 	}
-	if strings.Contains(read(t, dir, "generated/home/Caddyfile"), "3000") {
+	if strings.Contains(read(t, dir, "generated/home/caddy/Caddyfile"), "3000") {
 		t.Error("apply wrote files without an answer")
 	}
 }
@@ -387,13 +339,13 @@ func TestBundle(t *testing.T) {
 		body, _ := io.ReadAll(tr)
 		got[hdr.Name] = string(body)
 	}
-	for _, f := range []string{"docker-compose.yml", "nginx.conf", "wireguard/firewall.sh", "wireguard/wg_confs/wg0.conf"} {
+	for _, f := range []string{"docker-compose.yml", "proxy/nginx.conf", "tunnel/firewall.sh", "tunnel/wg0.conf", "tunnel/tunnel.env"} {
 		if got[f] != read(t, dir, "generated/edge/"+f) {
 			t.Errorf("bundle entry %s differs from generated/edge/%s", f, f)
 		}
 	}
-	if len(got) != 4 {
-		t.Errorf("bundle has %d entries, want 4", len(got))
+	if len(got) != 5 {
+		t.Errorf("bundle has %d entries, want 5", len(got))
 	}
 
 	// A stale bundle must not be handed out.
@@ -422,7 +374,7 @@ func TestBundleRefusesTerminal(t *testing.T) {
 func TestManualInstallCommand(t *testing.T) {
 	dir := project(t, strings.Replace(testConfig, "address: 198.51.100.7", "address: 198.51.100.7\n  ssh_port: 2222", 1))
 	_, out := ctl(t, dir, "", "push")
-	want := "docker compose run --rm -T ctl bundle | ssh -p 2222 <user>@198.51.100.7 'mkdir -p hearthgate && cd hearthgate && tar -xzf - && "
+	want := "docker compose run --rm -T ctl bundle | ssh -p 2222 <user>@198.51.100.7 'mkdir -p hearthgate && cd hearthgate && tar -xzf - && docker compose up -d --remove-orphans'"
 	if !strings.Contains(out, want) || strings.Count(out, "'") != 2 {
 		t.Errorf("manual install command is wrong or not safely quoted:\n%s", out)
 	}
@@ -499,7 +451,7 @@ func TestParseEdgeState(t *testing.T) {
 }
 
 func TestColor(t *testing.T) {
-	changes := []change{{path: "generated/edge/nginx.conf", lines: []string{"- old", "+ new"}}}
+	changes := []change{{path: "generated/edge/proxy/nginx.conf", lines: []string{"- old", "+ new"}}}
 	var plain, coloured bytes.Buffer
 	(&app{out: &plain}).printChanges(changes)
 	(&app{out: &coloured, color: true}).printChanges(changes)

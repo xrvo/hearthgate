@@ -1,0 +1,99 @@
+#!/bin/sh
+# Entrypoint of the Hearthgate image. One image serves every container in both
+# stacks; the first argument picks the role:
+#
+#   tunnel   WireGuard interface and firewall for a network namespace
+#   caddy    TLS and HTTP routing (home)
+#   nginx    TCP stream proxy (home and edge)
+#   healthy  the image's health check
+#
+# Anything else is passed to ctl, the one-shot configuration tool.
+#
+# Each role reads its configuration from /etc/hearthgate, which is mounted
+# read-only and holds only that role's files. The tunnel role needs the
+# NET_ADMIN capability; the others run without it.
+set -eu
+
+CONF=/etc/hearthgate
+ROLE=/run/hearthgate-role
+
+say() { echo "hearthgate: $*" >&2; }
+
+# need <file>: stop with an explanation when a generated file is not there.
+need() {
+	[ -f "$CONF/$1" ] && return
+	say "$CONF/$1 is missing: the configuration has not been generated yet."
+	say "At home, run:  docker compose run --rm ctl init   and then:  docker compose up -d"
+	say "On the edge, install the bundle from home:  docker compose run --rm ctl deploy"
+	exit 78
+}
+
+case "${1:-}" in
+tunnel)
+	echo starting > "$ROLE"
+	need wg0.conf
+	need tunnel.env
+	need firewall.sh
+	# ADDRESS is this end's tunnel address, PEER the other end's.
+	. "$CONF/tunnel.env"
+
+	if ! err=$(ip link add wg0 type wireguard 2>&1); then
+		case "$err" in
+		*"not permitted"*)
+			say "not allowed to create the WireGuard interface: $err"
+			say "This container needs the NET_ADMIN capability. Keep 'cap_add: [NET_ADMIN]' on this service in docker-compose.yml."
+			;;
+		*)
+			say "could not create the WireGuard interface: $err"
+			say "The kernel on this machine has no WireGuard support. Linux 5.6 and newer include it;"
+			say "check with 'uname -r'. On an older kernel, install the WireGuard module for your"
+			say "distribution, run 'sudo modprobe wireguard', and start this stack again."
+			;;
+		esac
+		exit 1
+	fi
+	if ! wg setconf wg0 "$CONF/wg0.conf"; then
+		say "could not load the tunnel configuration. If the line above is about a name that"
+		say "does not resolve, check edge.address in hearthgate.yml and DNS on this machine;"
+		say "this container restarts and tries again."
+		exit 1
+	fi
+	# The firewall goes in before the interface comes up, so there is no
+	# moment at which the tunnel is open and unfiltered.
+	sh "$CONF/firewall.sh" wg0
+	ip addr add "$ADDRESS/32" dev wg0
+	ip link set wg0 mtu 1420 up
+	ip route add "$PEER/32" dev wg0
+	echo up > "$ROLE"
+	say "tunnel is up as $ADDRESS, firewall loaded"
+
+	trap 'exit 0' TERM INT QUIT
+	while :; do
+		sleep 3600 &
+		wait $!
+	done
+	;;
+
+caddy)
+	need Caddyfile
+	exec caddy run --config "$CONF/Caddyfile" --adapter caddyfile
+	;;
+
+nginx)
+	need nginx.conf
+	exec nginx -c "$CONF/nginx.conf" -g 'daemon off;'
+	;;
+
+healthy)
+	# Only the tunnel role has something to wait for: it is healthy once the
+	# interface exists and the default-deny firewall is loaded.
+	[ -e "$ROLE" ] || exit 0
+	[ "$(cat "$ROLE")" = up ] || exit 1
+	ip link show wg0 >/dev/null 2>&1 || exit 1
+	iptables -S INPUT 2>/dev/null | grep -q -- '-P INPUT DROP'
+	;;
+
+*)
+	exec ctl "$@"
+	;;
+esac

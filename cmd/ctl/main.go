@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -193,20 +194,30 @@ func (a *app) loadConfig() (*config.Config, error) {
 	return cfg, nil
 }
 
-// renderAll renders every file and adds the settings that depend on where ctl
-// is running: the gateway runs as the project directory's owner, so generated
-// files stay owned by that user.
+// imageRepo is where releases of the Hearthgate image are published.
+const imageRepo = "ghcr.io/xrvo/hearthgate"
+
+var reImage = regexp.MustCompile(`^[a-z0-9][a-zA-Z0-9._/:@-]{0,254}$`)
+
+// edgeImage is the image the edge stack runs. The home stack's compose file
+// passes its own in HEARTHGATE_IMAGE, so both sides always run the same one.
+func edgeImage() (string, error) {
+	image := os.Getenv("HEARTHGATE_IMAGE")
+	if image == "" {
+		return imageRepo + ":" + version, nil
+	}
+	if !reImage.MatchString(image) {
+		return "", fmt.Errorf("HEARTHGATE_IMAGE %q is not a valid image reference", image)
+	}
+	return image, nil
+}
+
 func (a *app) renderAll(cfg *config.Config, st *state.State) (render.Files, error) {
-	files, err := render.Render(cfg, st)
+	image, err := edgeImage()
 	if err != nil {
 		return nil, err
 	}
-	if uid, gid, ok := dirOwner(a.dir); ok && uid != 0 {
-		env := files[render.EnvFile]
-		env.Content = append(env.Content, fmt.Appendf(nil, "HEARTHGATE_PUID=%d\nHEARTHGATE_PGID=%d\n", uid, gid)...)
-		files[render.EnvFile] = env
-	}
-	return files, nil
+	return render.Render(cfg, st, image)
 }
 
 type change struct {
@@ -219,11 +230,7 @@ type change struct {
 func (a *app) pending(files render.Files) ([]change, error) {
 	var out []change
 	for _, p := range files.Paths() {
-		full := filepath.Join(a.dir, filepath.FromSlash(p))
-		if info, err := os.Stat(full); err == nil && info.IsDir() {
-			return nil, fmt.Errorf("%s is a directory, but it should be a file. Run `ctl apply` to repair it", p)
-		}
-		old, err := os.ReadFile(full)
+		old, err := os.ReadFile(filepath.Join(a.dir, filepath.FromSlash(p)))
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return nil, err
 		}
@@ -425,9 +432,6 @@ func (a *app) cmdInit(ctx context.Context) error {
 	}
 	files, err := a.renderAll(cfg, st)
 	if err != nil {
-		return err
-	}
-	if err := a.clearStrayDirs(files, false); err != nil {
 		return err
 	}
 	if err := st.Save(a.statePath()); err != nil {
