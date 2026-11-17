@@ -176,7 +176,7 @@ PUSH="$WORK/push"
 mkdir -p "$PUSH/keys"
 cat > "$PUSH/hearthgate.yml" <<EOF
 edge:
-  address: 203.0.113.5
+  address: 198.51.100.7
   ssh: tester@host.docker.internal
   ssh_port: $SSH_PORT
 publish:
@@ -269,7 +269,9 @@ says "a VPS without Docker is explained" 'no `docker` command for user "tester"'
 
 sed -i "s/ssh_port: $SSH_PORT/ssh_port: 12223/" "$PUSH/hearthgate.yml"
 out=$(pushctl apply -yes -no-push 2>&1; pushctl push 2>&1 || true)
-says "a wrong SSH port is explained" "nothing accepts SSH connections on port 12223" "$out"
+# Linux refuses the connection; Docker Desktop reports the port unreachable.
+says "a wrong SSH port is explained" "edge.ssh_port" "$out"
+says "a failed push says how to retry" "docker compose run --rm -T ctl bundle" "$out"
 
 echo "== The home stack does not need an SSH folder to start ctl"
 NOSSH="$WORK/nossh"

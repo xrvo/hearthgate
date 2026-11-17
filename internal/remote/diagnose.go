@@ -222,9 +222,17 @@ const (
 	problemNoDocker
 	problemDockerDenied
 	problemDockerDown
+	problemNoCompose
+	problemOldCompose
+	problemPortInUse
+	problemSubnetOverlap
+	problemNetworkBusy
 )
 
-var reNoDocker = regexp.MustCompile(`docker: (command )?not found`)
+var (
+	reNoDocker  = regexp.MustCompile(`docker: (command )?not found`)
+	rePortInUse = regexp.MustCompile(`(?:Bind for|listen (?:tcp|udp)\d?) \S*:(\d+)(?: failed: port is already allocated|: bind: address already in use)`)
+)
 
 // classify recognises a failure from ssh's exit code and what it and the
 // remote command printed. Exit code 255 is ssh's own; anything else came
@@ -248,11 +256,12 @@ func classify(code int, output string) problem {
 			return problemAuth
 		case has("Could not resolve hostname"):
 			return problemUnresolved
+		// Where the wording differs, the second is musl's, which the ctl image uses.
 		case has("Connection timed out", "Operation timed out"):
 			return problemTimeout
 		case has("Connection refused"):
 			return problemRefused
-		case has("No route to host", "Network is unreachable"):
+		case has("No route to host", "Host is unreachable", "Network is unreachable", "Network unreachable"):
 			return problemNoRoute
 		case has("Connection closed by", "Connection reset by", "kex_exchange_identification"):
 			return problemClosed
@@ -267,6 +276,16 @@ func classify(code int, output string) problem {
 		return problemDockerDown
 	case reNoDocker.MatchString(output):
 		return problemNoDocker
+	case has("is not a docker command", "unknown shorthand flag: 'd' in -d"):
+		return problemNoCompose
+	case strings.Contains(lower, "additional propert") && strings.Contains(lower, "not allowed"):
+		return problemOldCompose
+	case has("port is already allocated", "address already in use"):
+		return problemPortInUse
+	case has("Pool overlaps with other one"):
+		return problemSubnetOverlap
+	case has("has active endpoints"):
+		return problemNetworkBusy
 	}
 	return problemUnknown
 }
@@ -288,7 +307,8 @@ func (c *Client) sshCommand() string {
 
 // explain turns a recognised problem into a message that says what happened
 // and what to try. It returns "" for problems it has nothing to say about.
-func (c *Client) explain(p problem) string {
+// output is what ssh and the remote command printed.
+func (c *Client) explain(p problem, output string) string {
 	var b strings.Builder
 	line := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
 	settings := fmt.Sprintf("edge.ssh (%s) and edge.ssh_port (%d) in hearthgate.yml", c.Target, c.Port)
@@ -356,6 +376,46 @@ func (c *Client) explain(p problem) string {
 		line("Signed in to %s, but the Docker daemon is not running there.", c.host())
 		line("What to try, on the VPS:")
 		line("  - sudo systemctl enable --now docker")
+
+	case problemNoCompose:
+		line("Docker on %s has no Compose plugin: `docker compose` is not a command there.", c.host())
+		line("What to try, on the VPS:")
+		line("  - install it: sudo apt-get install docker-compose-plugin, or see https://docs.docker.com/compose/install/linux/")
+		line("  - the older `docker-compose`, with a hyphen, is a different program and is not enough")
+
+	case problemOldCompose:
+		line("The Compose plugin on %s is too old to read the edge's compose file.", c.host())
+		line("Hearthgate needs Compose 2.17 or newer.")
+		line("What to try, on the VPS:")
+		line("  - see the version: docker compose version")
+		line("  - update it: sudo apt-get update && sudo apt-get install docker-compose-plugin, or see")
+		line("    https://docs.docker.com/compose/install/linux/")
+
+	case problemPortInUse:
+		port, pattern := "a port it needs", ":<port> "
+		if m := rePortInUse.FindStringSubmatch(output); m != nil {
+			port, pattern = "port "+m[1], ":"+m[1]+" "
+		}
+		line("Docker on %s could not start the edge: %s is already in use there.", c.host(), port)
+		line("The files were copied; only the start failed.")
+		line("What to try, on the VPS:")
+		line("  - find what holds it: sudo ss -ltnup | grep '%s'", pattern)
+		line("    It is often a web server (nginx, Apache, Caddy) or another container (docker ps).")
+		line("  - stop or move that program, then run this command again")
+
+	case problemSubnetOverlap:
+		line("Docker on %s could not create the hearthgate-agents network: another Docker network", c.host())
+		line("there already uses an overlapping address range.")
+		line("What to try:")
+		line("  - pick another range: set networks.agents in hearthgate.yml (for example 10.211.3.0/24), then `ctl apply`")
+		line("  - or, on the VPS, find the other network: docker network ls, then docker network inspect <name>")
+
+	case problemNetworkBusy:
+		line("Docker on %s could not replace a network, because containers are still attached to it.", c.host())
+		line("This happens after networks.agents changes.")
+		line("What to try, on the VPS:")
+		line("  - see what is attached: docker network inspect hearthgate-agents")
+		line("  - stop those containers, run this command again, then start them")
 
 	default:
 		return ""

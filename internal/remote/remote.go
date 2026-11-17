@@ -94,7 +94,8 @@ func (c *Client) Run(ctx context.Context, script string, stdin io.Reader) ([]byt
 	if errors.As(runErr, &exit) {
 		code = exit.ExitCode()
 	}
-	if msg := c.explain(classify(code, errBuf.String()+out.String())); msg != "" {
+	output := errBuf.String() + out.String()
+	if msg := c.explain(classify(code, output), output); msg != "" {
 		return out.Bytes(), errors.New(msg)
 	}
 	return out.Bytes(), fmt.Errorf("ssh %s: %w", c.Target, runErr)

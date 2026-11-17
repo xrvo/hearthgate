@@ -38,7 +38,7 @@ Hearthgate is deliberately small. It has no web UI, no built-in login or SSO lay
 
 ## Requirements
 
-- Docker with Compose v2 on both machines
+- Docker with Compose 2.17 or newer on both machines (`docker compose version`)
 - Linux kernel 5.6+ (built-in WireGuard) on both machines
 - A VPS with a public IP, and `443/tcp`, `80/tcp` and `51820/udp` open
 - A DNS record for each hostname you publish, pointing at the VPS
@@ -80,6 +80,8 @@ docker compose run --rm ctl check   # verify tunnel, certificates and firewall
 ```
 
 Certificates are issued automatically the first time each hostname is requested.
+
+Run `ctl init` before the first `docker compose up`. If you start the stack first, Docker creates empty directories where the generated files belong; `ctl init` notices and offers to remove them.
 
 `ctl push` signs in with your SSH agent, or with `id_ed25519`, `id_ecdsa` or `id_rsa` from `~/.ssh`. It does not read `~/.ssh/config`. If your keys live elsewhere, set `HEARTHGATE_SSH_DIR` to that directory.
 
@@ -182,6 +184,8 @@ In the hub, add a system with host `gateway` and port `45876`. Leave the agent's
 | `networks.dmz` | `10.210.1.0/24` | Subnet of `hearthgate-dmz` |
 | `networks.mgmt` | `10.210.2.0/24` | Subnet of `hearthgate-mgmt` |
 | `networks.agents` | `10.210.3.0/24` | Subnet of `hearthgate-agents` |
+
+Docker cannot change the subnet of a network that containers are attached to. If you change one under `networks`, `ctl apply` tells you what to stop first.
 
 An agent's port is used unchanged on the tunnel and at `gateway:<port>`. Ports 80, 443 and 2019 are taken, and two agents can't share one, so give a different port where needed:
 

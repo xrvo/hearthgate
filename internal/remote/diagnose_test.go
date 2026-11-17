@@ -21,6 +21,8 @@ func TestClassify(t *testing.T) {
 		{255, "ssh: connect to host 203.0.113.5 port 22: Connection timed out", problemTimeout},
 		{255, "ssh: connect to host 203.0.113.5 port 2222: Connection refused", problemRefused},
 		{255, "ssh: connect to host 203.0.113.5 port 22: No route to host", problemNoRoute},
+		{255, "ssh: connect to host 203.0.113.5 port 22: Host is unreachable", problemNoRoute},
+		{255, "ssh: connect to host host.docker.internal port 12223: Network unreachable", problemNoRoute},
 		{255, "ssh: Could not resolve hostname vps.example: Name does not resolve", problemUnresolved},
 		{255, "@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @\nHost key verification failed.", problemHostKeyChanged},
 		{255, "kex_exchange_identification: Connection closed by remote host", problemClosed},
@@ -29,9 +31,16 @@ func TestClassify(t *testing.T) {
 		{127, "bash: line 5: docker: command not found", problemNoDocker},
 		{1, "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock", problemDockerDenied},
 		{1, "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?", problemDockerDown},
+		{1, "docker: 'compose' is not a docker command.\nSee 'docker --help'", problemNoCompose},
+		{125, "unknown shorthand flag: 'd' in -d", problemNoCompose},
+		{15, "validating docker-compose.yml: services.proxy.depends_on.tunnel Additional property restart is not allowed", problemOldCompose},
+		{1, "Error response from daemon: driver failed programming external connectivity on endpoint x: Bind for 0.0.0.0:443 failed: port is already allocated", problemPortInUse},
+		{1, "Error response from daemon: failed to listen on TCP socket: listen tcp4 0.0.0.0:80: bind: address already in use", problemPortInUse},
+		{1, "failed to create network hearthgate-agents: Error response from daemon: invalid pool request: Pool overlaps with other one on this address space", problemSubnetOverlap},
+		{1, "error while removing network: network hearthgate-agents id 1f2 has active endpoints", problemNetworkBusy},
 		// A remote command's output must not be mistaken for an ssh failure.
 		{1, "Permission denied (publickey).", problemUnknown},
-		{1, "Error response from daemon: port is already allocated", problemUnknown},
+		{1, "Error response from daemon: no such image", problemUnknown},
 	}
 	for _, c := range cases {
 		if got := classify(c.code, c.output); got != c.want {
@@ -120,7 +129,7 @@ func explainAuth(t *testing.T, c *Client) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(c.Close)
-	return c.explain(problemAuth)
+	return c.explain(problemAuth, "")
 }
 
 func wantAll(t *testing.T, got string, wants ...string) {
@@ -189,11 +198,18 @@ func TestExplainOtherProblems(t *testing.T) {
 		problemDockerDown:     {"daemon is not running", "systemctl"},
 		problemTooManyKeys:    {"too many keys", "ssh-add -D"},
 		problemClosed:         {"closed it before signing in", "fail2ban"},
+		problemNoCompose:      {"no Compose plugin", "docker-compose-plugin"},
+		problemOldCompose:     {"too old", "2.17"},
+		problemSubnetOverlap:  {"overlapping address range", "networks.agents"},
+		problemNetworkBusy:    {"still attached", "docker network inspect hearthgate-agents"},
 	}
 	for p, wants := range cases {
-		wantAll(t, c.explain(p), wants...)
+		wantAll(t, c.explain(p, ""), wants...)
 	}
-	if msg := c.explain(problemUnknown); msg != "" {
+	wantAll(t, c.explain(problemPortInUse, "Bind for 0.0.0.0:443 failed: port is already allocated"), "port 443 is already in use", "grep ':443 '")
+	wantAll(t, c.explain(problemPortInUse, "listen udp4 0.0.0.0:51820: bind: address already in use"), "port 51820 is already in use")
+	wantAll(t, c.explain(problemPortInUse, "address already in use"), "a port it needs is already in use")
+	if msg := c.explain(problemUnknown, ""); msg != "" {
 		t.Errorf("explain(unknown) = %q", msg)
 	}
 }

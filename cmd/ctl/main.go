@@ -119,7 +119,7 @@ func run(ctx context.Context, args []string, in io.Reader, out, errw io.Writer) 
 
 	if err := cmd(ctx); err != nil {
 		if !errors.Is(err, errReported) {
-			fmt.Fprintf(errw, "error: %v\n", err)
+			fmt.Fprintf(errw, "error: %v\n", withPermissionHelp(err))
 		}
 		return 1
 	}
@@ -142,6 +142,10 @@ func (a *app) loadConfig() (*config.Config, error) {
 	cfg, err := config.Parse(data)
 	if err != nil {
 		return nil, fmt.Errorf("%s:\n%w", a.cfgPath, err)
+	}
+	if lines := placeholders(data); len(lines) > 0 {
+		return nil, fmt.Errorf("%s still has values from the example:\n  %s\nReplace them with your VPS's address and your own hostname, then run this command again",
+			a.cfgPath, strings.Join(lines, "\n  "))
 	}
 	return cfg, nil
 }
@@ -172,7 +176,11 @@ type change struct {
 func (a *app) pending(files render.Files) ([]change, error) {
 	var out []change
 	for _, p := range files.Paths() {
-		old, err := os.ReadFile(filepath.Join(a.dir, filepath.FromSlash(p)))
+		full := filepath.Join(a.dir, filepath.FromSlash(p))
+		if info, err := os.Stat(full); err == nil && info.IsDir() {
+			return nil, fmt.Errorf("%s is a directory, but it should be a file. Run `ctl apply` to repair it", p)
+		}
+		old, err := os.ReadFile(full)
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return nil, err
 		}
@@ -231,14 +239,31 @@ func (a *app) write(files render.Files) error {
 	return nil
 }
 
-func (a *app) confirm(question string) bool {
+// errNoAnswer means a question could not be asked: standard input is closed,
+// as it is under cron, in a pipe, or with `docker compose run -T`.
+var errNoAnswer = errors.New("this needs a yes or no, and there is no terminal to ask on")
+
+func (a *app) confirm(question string) (bool, error) {
 	fmt.Fprintf(a.out, "%s [y/N] ", question)
-	line, _ := a.in.ReadString('\n')
+	line, err := a.in.ReadString('\n')
+	if err != nil && strings.TrimSpace(line) == "" {
+		fmt.Fprintln(a.out)
+		return false, errNoAnswer
+	}
 	switch strings.ToLower(strings.TrimSpace(line)) {
 	case "y", "yes":
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
+}
+
+// confirmOrYes asks a question that the -yes flag would have answered.
+func (a *app) confirmOrYes(question string) (bool, error) {
+	ok, err := a.confirm(question)
+	if errors.Is(err, errNoAnswer) {
+		return false, fmt.Errorf("%w.\nTo go ahead without being asked, add -yes to the command", err)
+	}
+	return ok, err
 }
 
 func (a *app) client(cfg *config.Config) *remote.Client {
@@ -271,6 +296,7 @@ func (a *app) push(ctx context.Context, cfg *config.Config, files render.Files) 
 	if err != nil {
 		return fmt.Errorf("the edge was not updated.\n\n%w\n\nTo install the edge with your own ssh setup instead (it may use ~/.ssh/config, jump hosts or a password):\n  %s", err, bundleCommand(cfg))
 	}
+	a.markPushed(files)
 	fmt.Fprintln(a.out, "Edge updated.")
 	return nil
 }
@@ -327,6 +353,9 @@ func (a *app) cmdInit(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := a.clearStrayDirs(files, false); err != nil {
+		return err
+	}
 	if err := st.Save(a.statePath()); err != nil {
 		return err
 	}
@@ -365,8 +394,12 @@ func (a *app) cmdRotate(ctx context.Context, yes, noPush bool) error {
 	}
 	fmt.Fprintln(a.out, "This replaces the WireGuard keys on both sides. The tunnel is down from the")
 	fmt.Fprintln(a.out, "moment the edge restarts until you run `docker compose up -d` at home.")
-	if !yes && !a.confirm("Rotate keys?") {
-		return errors.New("aborted")
+	if !yes {
+		if ok, err := a.confirmOrYes("Rotate keys?"); err != nil {
+			return err
+		} else if !ok {
+			return errors.New("aborted")
+		}
 	}
 	st, err := state.New()
 	if err != nil {
@@ -380,17 +413,30 @@ func (a *app) applyState(ctx context.Context, cfg *config.Config, st *state.Stat
 	if err != nil {
 		return err
 	}
+	if err := a.clearStrayDirs(files, yes); err != nil {
+		return err
+	}
 	changes, err := a.pending(files)
 	if err != nil {
 		return err
 	}
 	if len(changes) == 0 {
 		fmt.Fprintln(a.out, "Nothing to change: generated files already match hearthgate.yml.")
+		if a.edgeBehind(cfg, files) && !noPush {
+			fmt.Fprintf(a.out, "ctl has not pushed this configuration to the edge, though. Unless you installed it there yourself, run:\n  %s\n", pushCommand)
+		}
 		return nil
 	}
 	a.printChanges(changes)
-	if !yes && !a.confirm("Apply these changes?") {
-		return errors.New("aborted; nothing was written")
+	for _, note := range networkNotes(changes) {
+		fmt.Fprintf(a.out, "%s\n\n", note)
+	}
+	if !yes {
+		if ok, err := a.confirmOrYes("Apply these changes?"); err != nil {
+			return fmt.Errorf("%w; nothing was written", err)
+		} else if !ok {
+			return errors.New("aborted; nothing was written")
+		}
 	}
 	if saveState {
 		if err := st.Save(a.statePath()); err != nil {
@@ -406,7 +452,7 @@ func (a *app) applyState(ctx context.Context, cfg *config.Config, st *state.Stat
 		switch {
 		case cfg.SSH != "" && !noPush:
 			if err := a.push(ctx, cfg, files); err != nil {
-				return err
+				return fmt.Errorf("%w\n\n%s", err, afterFailedPush(saveState))
 			}
 		default:
 			a.manualEdgeHint(cfg)
