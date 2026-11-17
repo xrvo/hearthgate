@@ -17,10 +17,12 @@ HTTP_PORT=18080
 WG_PORT=51821
 AGENT_PORT=19090
 SSH_PORT=12222
+EDGE_SSH_PORT=12224
 HOME_IP=10.210.0.2
 DMZ_IP=10.210.1.2
 MGMT_IP=10.210.2.2
 
+DOCKER_CLI=docker:29-cli@sha256:34507eb5069d8be82c95dd3b6987d4250fd5fee49b82e2509b7d7a7030740d6d
 ALPINE=alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 WHOAMI=traefik/whoami:v1.11.0@sha256:200689790a0a0ea48ca45992e0450bc26ccab5307375b41c84dfc4f2475937ab
 
@@ -32,17 +34,17 @@ WORK_MOUNT=$(hostpath "$WORK")
 
 home() { (cd "$WORK" && docker compose -p hearthgate-e2e "$@"); }
 edge() { (cd "$WORK/generated/edge" && docker compose -p hearthgate-e2e-edge "$@"); }
-ctl()  { docker run --rm --add-host host.docker.internal:host-gateway -v "$WORK_MOUNT:/work" hearthgate-ctl:e2e "$@"; }
+ctl()  { docker run --rm --add-host host.docker.internal:host-gateway -v "$WORK_MOUNT:/work" -v "$WORK_MOUNT/edgekeys:/ssh:ro" hearthgate-ctl:e2e "$@"; }
 
 # teardown removes everything a run creates. It works by project name, so it
 # also clears what an earlier, interrupted or KEEP=1 run left behind.
 teardown() {
-	docker rm -f e2e-app e2e-agent e2e-sshd >/dev/null 2>&1 || true
+	docker rm -f e2e-app e2e-agent e2e-sshd e2e-edge-ssh >/dev/null 2>&1 || true
 	docker compose -p hearthgate-e2e down -v --remove-orphans >/dev/null 2>&1 || true
 	docker compose -p hearthgate-e2e-edge down -v --remove-orphans >/dev/null 2>&1 || true
 	docker compose -p hearthgate-e2e-nossh down -v --remove-orphans >/dev/null 2>&1 || true
 	# Generated files may belong to the container user, so remove them from a container.
-	docker run --rm -v "$WORK_MOUNT:/w" "$ALPINE" sh -c 'rm -rf /w/generated /w/.env /w/push /w/nossh' >/dev/null 2>&1 || true
+	docker run --rm -v "$WORK_MOUNT:/w" "$ALPINE" sh -c 'rm -rf /w/generated /w/.env /w/push /w/nossh /w/edgekeys' >/dev/null 2>&1 || true
 	rm -rf "$WORK"
 }
 cleanup() {
@@ -67,11 +69,13 @@ refuse() { local d=$1; shift; if "$@" >/dev/null 2>&1; then fail "$d"; else pass
 
 echo "== Building ctl and rendering the configuration"
 teardown
-mkdir -p "$WORK"
+mkdir -p "$WORK/edgekeys"
 cp "$ROOT/docker-compose.yml" "$ROOT/tests/e2e/docker-compose.override.yml" "$WORK/"
 cat > "$WORK/hearthgate.yml" <<EOF
 edge:
   address: host.docker.internal
+  ssh: root@host.docker.internal
+  ssh_port: $EDGE_SSH_PORT
   wireguard_port: $WG_PORT
   https_port: $HTTPS_PORT
   http_port: $HTTP_PORT
@@ -163,7 +167,32 @@ for side in home edge; do
 	if [ "$(echo "$fwd" | tr -d '\r')" = 0 ]; then pass "$side namespace does not forward packets"; else fail "$side namespace does not forward packets"; fi
 done
 
-echo "== ctl check and ctl apply"
+echo "== ctl status, check and apply, reaching the running edge over SSH"
+# An SSH server that controls the edge stack started above: it has the edge's
+# directory and this host's Docker. Its docker command names the compose
+# project this test uses.
+docker run -d --name e2e-edge-ssh -p "$EDGE_SSH_PORT:22" \
+	-v /var/run/docker.sock:/var/run/docker.sock \
+	-v "$WORK_MOUNT/generated/edge:/root/hearthgate:ro" -v "$WORK_MOUNT/edgekeys:/keys" "$DOCKER_CLI" sh -c '
+	set -e
+	apk add --no-cache openssh-server >/dev/null
+	ssh-keygen -A >/dev/null
+	ssh-keygen -q -t ed25519 -N "" -f /keys/id_ed25519
+	mkdir -p /root/.ssh && cp /keys/id_ed25519.pub /root/.ssh/authorized_keys && chmod 700 /root/.ssh
+	mv /usr/local/bin/docker /usr/local/bin/docker.real
+	printf "#!/bin/sh\nCOMPOSE_PROJECT_NAME=hearthgate-e2e-edge exec /usr/local/bin/docker.real \"\$@\"\n" > /usr/local/bin/docker
+	chmod +x /usr/local/bin/docker
+	exec /usr/sbin/sshd -D -e' >/dev/null
+for _ in $(seq 1 60); do
+	docker exec e2e-edge-ssh sh -c 'test -x /usr/local/bin/docker.real && nc -z 127.0.0.1 22' >/dev/null 2>&1 && break
+	sleep 1
+done
+
+status_out=$(ctl status 2>&1) && status_rc=0 || status_rc=$?
+[ "$status_rc" = 0 ] && pass "ctl status succeeds while everything runs" || { fail "ctl status succeeds while everything runs"; echo "$status_out"; }
+says "status sees both edge containers" "proxy container is running" "$status_out"
+says "status compares the edge's files with home's" "the edge has the configuration generated at home" "$status_out"
+says "status sees home connected" "tunnel: home is connected" "$status_out"
 check_out=$(ctl check 2>&1) && check_rc=0 || check_rc=$?
 if [ "$check_rc" = 0 ] && echo "$check_out" | grep -q 'app.e2e.test: certificate from'; then
 	pass "ctl check passes and sees the certificate served from home"
@@ -172,6 +201,8 @@ else
 	echo "$check_out"
 fi
 says "ctl check ends with a plain verdict" "All checks passed." "$check_out"
+says "ctl check probes the home firewall from the edge" "home port 22 is closed to the edge" "$check_out"
+says "ctl check finds the one open port" "edge reaches the home gateway on 443" "$check_out"
 home stop caddy >/dev/null 2>&1
 down_out=$(ctl check 2>&1) && down_rc=0 || down_rc=$?
 home start caddy >/dev/null 2>&1
@@ -179,6 +210,30 @@ home start caddy >/dev/null 2>&1
 says "the failure says where to look" "no TLS answer came back from home" "$down_out"
 says "and what to run" "docker compose logs caddy" "$down_out"
 expect "ctl apply reports nothing to change" sh -c "docker run --rm -v '$WORK_MOUNT:/work' hearthgate-ctl:e2e apply | grep -q 'Nothing to change'"
+
+echo "== ctl edge: stop, inspect and restart the running edge"
+expect "edge logs shows the proxy's log" ctl edge logs -tail 5 proxy
+down_out=$(ctl edge down -yes 2>&1) && down_rc=0 || down_rc=$?
+[ "$down_rc" = 0 ] && pass "edge down stops the edge" || { fail "edge down stops the edge"; echo "$down_out"; }
+says "edge down says how to bring it back" "docker compose run --rm ctl edge up" "$down_out"
+refuse "the published app is offline while the edge is down" fetch
+stopped_out=$(ctl edge status 2>&1) && stopped_rc=0 || stopped_rc=$?
+[ "$stopped_rc" != 0 ] && pass "edge status fails while the edge is down" || fail "edge status fails while the edge is down"
+says "status names the stopped containers" "tunnel container is not running" "$stopped_out"
+expect "edge restart starts it again" ctl edge restart
+body=""
+for _ in $(seq 1 45); do
+	body=$(fetch || true)
+	echo "$body" | grep -q '^Hostname:' && break
+	sleep 2
+done
+if echo "$body" | grep -q '^Hostname:'; then
+	pass "the published app answers again after the restart"
+else
+	fail "the published app answers again after the restart"
+	echo "--- tunnel logs"; edge logs --tail 20 tunnel || true
+	echo "--- proxy logs"; edge logs --tail 20 proxy || true
+fi
 
 echo "== ctl push over SSH (to a throwaway SSH server with a stand-in docker command)"
 PUSH="$WORK/push"
@@ -226,6 +281,8 @@ expect "push recorded the SSH user for the tunnel container" remote 'grep -q "^H
 expect "push started the edge stack" remote 'grep -qx "compose up -d --remove-orphans" /tmp/docker-calls'
 says "push shows the edge's own output as it arrives" "edge | compose up -d --remove-orphans" "$push_out"
 says "push says what it copied and what to run next" "Copied 4 files to tester@host.docker.internal:hearthgate" "$push_out"
+up_out=$(pushctl edge up 2>&1 || true)
+says "edge up starts the installed stack" "edge | compose up -d --remove-orphans" "$up_out"
 expect "pushed bundle is identical to the rendered one" sh -c "docker exec -u tester e2e-sshd cat /home/tester/hearthgate/nginx.conf | cmp -s - '$PUSH/generated/edge/nginx.conf'"
 
 

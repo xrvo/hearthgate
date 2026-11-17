@@ -76,6 +76,15 @@ func (c *Client) run(ctx context.Context, script string, stdin io.Reader, live f
 		return nil, err
 	}
 	known, _ := os.ReadFile(c.KnownHosts)
+	// A new host key is announced as soon as the edge says anything, so the
+	// fingerprint comes before the edge's output and not after it.
+	announced := false
+	announce := func() {
+		if !announced {
+			announced = true
+			c.announceHostKeys(known)
+		}
+	}
 
 	cmd := exec.CommandContext(ctx, "ssh", append(args, script)...)
 	cmd.Env = c.env()
@@ -84,7 +93,10 @@ func (c *Client) run(ctx context.Context, script string, stdin io.Reader, live f
 	cmd.Stdout = &out
 	var stream *lineWriter
 	if live != nil {
-		stream = &lineWriter{fn: live}
+		stream = &lineWriter{fn: func(line string) {
+			announce()
+			live(line)
+		}}
 		cmd.Stdout = io.MultiWriter(&out, stream)
 	}
 	// ssh's standard error also carries what the edge's command wrote to its own.
@@ -99,7 +111,7 @@ func (c *Client) run(ctx context.Context, script string, stdin io.Reader, live f
 	if stream != nil {
 		stream.Flush()
 	}
-	c.announceHostKeys(known)
+	announce()
 
 	if runErr == nil {
 		return out.Bytes(), nil
@@ -201,6 +213,13 @@ func InstallScript(dir string) string {
 // be trusted: they are passed to the remote shell as written.
 func (c *Client) Compose(ctx context.Context, args string) ([]byte, error) {
 	return c.Run(ctx, fmt.Sprintf("cd %s && docker compose %s", c.Dir, args), nil)
+}
+
+// ComposeStream is Compose for commands whose output is the point: each line,
+// from either stream, is handed to onLine as it arrives.
+func (c *Client) ComposeStream(ctx context.Context, args string, onLine func(string)) error {
+	_, err := c.run(ctx, fmt.Sprintf("cd %s && docker compose %s 2>&1", c.Dir, args), nil, onLine)
+	return err
 }
 
 // Archive packs the bundle as a gzipped tarball.

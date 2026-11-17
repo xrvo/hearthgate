@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/xrvo/hearthgate/internal/config"
+	"github.com/xrvo/hearthgate/internal/render"
 )
 
 const testConfig = `
@@ -424,6 +425,76 @@ func TestManualInstallCommand(t *testing.T) {
 	want := "docker compose run --rm -T ctl bundle | ssh -p 2222 <user>@198.51.100.7 'mkdir -p hearthgate && cd hearthgate && tar -xzf - && "
 	if !strings.Contains(out, want) || strings.Count(out, "'") != 2 {
 		t.Errorf("manual install command is wrong or not safely quoted:\n%s", out)
+	}
+}
+
+func TestEdgeCommandParsing(t *testing.T) {
+	dir := project(t, testConfig)
+	for _, args := range [][]string{
+		{"edge"}, {"edge", "bogus"}, {"edge", "up", "extra"}, {"edge", "logs", "caddy"},
+		{"edge", "logs", "proxy", "extra"}, {"edge", "logs", "-tail", "-1"},
+	} {
+		code, out := ctl(t, dir, "", args...)
+		if code != 2 || !strings.Contains(out, "Usage: ctl edge") {
+			t.Errorf("%v: code %d\n%s", args, code, out)
+		}
+	}
+	// Without edge.ssh there is nothing to reach, whatever the command.
+	for _, args := range [][]string{{"edge", "up"}, {"edge", "down", "-yes"}, {"edge", "logs", "-f", "-tail", "5", "tunnel"}, {"edge", "status"}} {
+		code, out := ctl(t, dir, "", args...)
+		if code != 1 || !strings.Contains(out, "edge.ssh is not set") {
+			t.Errorf("%v: code %d\n%s", args, code, out)
+		}
+	}
+	code, out := ctl(t, dir, "", "status")
+	if code != 1 || !strings.Contains(out, "run `ctl init` first") {
+		t.Errorf("status before init: code %d\n%s", code, out)
+	}
+	ctl(t, dir, "", "init")
+	code, out = ctl(t, dir, "", "status")
+	if code != 0 || !strings.Contains(out, "generated files match") || !strings.Contains(out, "skip  edge.ssh is not set") {
+		t.Errorf("status without edge.ssh: code %d\n%s", code, out)
+	}
+}
+
+func TestEdgeDownAsksFirst(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // no ssh client: reaching the edge fails
+	dir := project(t, strings.Replace(testConfig, "address: 198.51.100.7", "address: 198.51.100.7\n  ssh: me@198.51.100.7", 1))
+	code, out := ctl(t, dir, "n\n", "edge", "down")
+	if code != 1 || !strings.Contains(out, "Every published hostname goes offline") || !strings.Contains(out, "Cancelled") || strings.Contains(out, "Stopping") {
+		t.Errorf("declined down: code %d\n%s", code, out)
+	}
+	if code, out := ctl(t, dir, "", "edge", "down"); code != 1 || !strings.Contains(out, "add -yes") {
+		t.Errorf("down with no terminal: code %d\n%s", code, out)
+	}
+	if code, out := ctl(t, dir, "", "edge", "down", "-yes"); code != 1 || !strings.Contains(out, "Stopping the edge stack on me@198.51.100.7") {
+		t.Errorf("down -yes: code %d\n%s", code, out)
+	}
+}
+
+func TestParseEdgeState(t *testing.T) {
+	st := parseEdgeState("::absent\n")
+	if st.installed {
+		t.Error("absent edge reported as installed")
+	}
+	st = parseEdgeState("::files\nabc123  docker-compose.yml\r\ndef456 *nginx.conf\n::running\ntunnel\n::tunnel\nKEY=\t1700000000\nnow\n1700000042\n")
+	if !st.installed || !st.running["tunnel"] || st.running["proxy"] {
+		t.Errorf("running = %v", st.running)
+	}
+	if st.sums["docker-compose.yml"] != "abc123" || st.sums["nginx.conf"] != "def456" {
+		t.Errorf("sums = %v", st.sums)
+	}
+	if age, err := handshakeAge(st.handshake); err != nil || age != 42*time.Second {
+		t.Errorf("handshake age = %v, %v", age, err)
+	}
+
+	bundle := render.Files{"a": {Content: []byte("abc")}, "b": {Content: []byte("x")}}
+	sums := map[string]string{"a": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "b": "wrong"}
+	if got := differing(bundle, sums); len(got) != 1 || got[0] != "b" {
+		t.Errorf("differing = %v", got)
+	}
+	if got := differing(bundle, nil); len(got) != 2 {
+		t.Errorf("differing with nothing on the edge = %v", got)
 	}
 }
 

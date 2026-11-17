@@ -236,6 +236,7 @@ const (
 	problemPortInUse
 	problemSubnetOverlap
 	problemNetworkBusy
+	problemNotInstalled
 )
 
 var (
@@ -279,6 +280,9 @@ func classify(code int, output string) problem {
 	}
 	lower := strings.ToLower(output)
 	switch {
+	case has("cd: can't cd to", "no configuration file provided"),
+		strings.Contains(output, "cd: ") && strings.Contains(output, "No such file or directory"):
+		return problemNotInstalled
 	case strings.Contains(lower, "permission denied while trying to connect to the docker"):
 		return problemDockerDenied
 	case strings.Contains(lower, "cannot connect to the docker daemon"):
@@ -385,6 +389,12 @@ func (c *Client) explain(p problem, output string) string {
 		line("Signed in to %s, but the Docker daemon is not running there.", c.host())
 		line("What to try, on the VPS:")
 		line("  - sudo systemctl enable --now docker")
+
+	case problemNotInstalled:
+		line("The edge is not installed on %s yet: there is no bundle in %s there.", c.host(), c.Dir)
+		line("What to try:")
+		line("  - install and start it: docker compose run --rm ctl push")
+		line("  - if it is installed somewhere else, set edge.dir in hearthgate.yml to that directory")
 
 	case problemNoCompose:
 		line("Docker on %s has no Compose plugin: `docker compose` is not a command there.", c.host())

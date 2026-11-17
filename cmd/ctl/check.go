@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/xrvo/hearthgate/internal/config"
+	"github.com/xrvo/hearthgate/internal/render"
 	"github.com/xrvo/hearthgate/internal/state"
 )
 
@@ -56,39 +57,75 @@ func (r *reporter) skip(format string, args ...any) {
 	fmt.Fprintf(r.app.out, "  %s  %s\n", r.app.paint(yellow, "skip"), fmt.Sprintf(format, args...))
 }
 
+// reportConfig prints whether the generated files are in step with
+// hearthgate.yml. It returns them when they are, and nil otherwise.
+func (a *app) reportConfig(r *reporter, cfg *config.Config) render.Files {
+	r.section("Configuration")
+	r.ok("%s is valid", a.cfgPath)
+	st, err := state.Load(a.statePath())
+	if err != nil {
+		r.fail("%v", err)
+		return nil
+	}
+	files, err := a.renderAll(cfg, st)
+	if err != nil {
+		r.fail("render: %v", err)
+		return nil
+	}
+	changes, err := a.pending(files)
+	if err != nil {
+		r.fail("%v", err)
+		return nil
+	}
+	if len(changes) > 0 {
+		r.fail("generated files do not match hearthgate.yml (%s)", plural(len(changes), "file differs"))
+		r.hint("preview and apply the difference: " + cmdApply)
+		return nil
+	}
+	r.ok("generated files match hearthgate.yml")
+	return files
+}
+
+// generated is reportConfig without the report.
+func (a *app) generated(cfg *config.Config) (render.Files, bool) {
+	st, err := state.Load(a.statePath())
+	if err != nil {
+		return nil, false
+	}
+	files, err := a.renderAll(cfg, st)
+	if err != nil {
+		return nil, false
+	}
+	if changes, err := a.pending(files); err != nil || len(changes) > 0 {
+		return nil, false
+	}
+	return files.WithPrefix(render.EdgeDir), true
+}
+
 func (a *app) cmdCheck(ctx context.Context) error {
 	cfg, err := a.loadConfig()
 	if err != nil {
 		return err
 	}
 	r := &reporter{app: a}
-
-	r.section("Configuration")
-	r.ok("%s is valid", a.cfgPath)
-	st, err := state.Load(a.statePath())
-	if err != nil {
-		r.fail("%v", err)
-	} else if files, err := a.renderAll(cfg, st); err != nil {
-		r.fail("render: %v", err)
-	} else if changes, err := a.pending(files); err != nil {
-		r.fail("%v", err)
-	} else if len(changes) > 0 {
-		r.fail("generated files do not match hearthgate.yml (%s)", plural(len(changes), "file differs"))
-		r.hint("preview and apply the difference: " + cmdApply)
-	} else {
-		r.ok("generated files match hearthgate.yml")
-	}
+	files := a.reportConfig(r, cfg)
 
 	r.section("Public endpoints")
 	for _, p := range cfg.Publish {
 		checkTLS(ctx, r, cfg, p.Hostname)
 	}
 
-	r.section("Tunnel and firewall, seen from the edge")
 	if cfg.SSH == "" {
+		r.section("Edge")
 		r.skip("edge.ssh is not set, so the edge cannot be inspected")
 	} else {
-		a.checkEdge(ctx, r, cfg)
+		var bundle render.Files
+		if files != nil {
+			bundle = files.WithPrefix(render.EdgeDir)
+		}
+		if st := a.reportEdge(ctx, r, cfg, bundle); st != nil && st.running["tunnel"] {
+			a.probeHome(ctx, r, cfg)
+		}
 	}
 
 	if r.failed > 0 {
@@ -189,29 +226,13 @@ func tunnelHints(r *reporter, cfg *config.Config) {
 	)
 }
 
-// checkEdge asks the edge for the handshake age, then tries from inside the
-// edge's tunnel namespace to open ports on the home gateway. Only 443 may
-// answer; anything else open is a hole in the home firewall.
-func (a *app) checkEdge(ctx context.Context, r *reporter, cfg *config.Config) {
+// probeHome tries, from inside the edge's tunnel namespace, to open ports on
+// the home gateway. Only 443 may answer; anything else open is a hole in the
+// home firewall.
+func (a *app) probeHome(ctx context.Context, r *reporter, cfg *config.Config) {
+	r.section("Home firewall, probed from the edge")
 	c := a.client(cfg)
 	defer c.Close()
-
-	out, err := c.Compose(ctx, `exec -T tunnel sh -c "wg show wg0 latest-handshakes; echo now; date +%s"`)
-	if err != nil {
-		r.fail("could not query the edge tunnel")
-		r.detail(err)
-		r.hint("if the edge stack is not running, start it: " + pushCommand)
-		return
-	}
-	if age, err := handshakeAge(string(out)); err != nil {
-		r.fail("tunnel: %v", err)
-		tunnelHints(r, cfg)
-	} else if age > maxHandshakeAge {
-		r.fail("tunnel: last handshake was %s ago; home is not connected", age.Round(time.Second))
-		tunnelHints(r, cfg)
-	} else {
-		r.ok("tunnel: last handshake %s ago", age.Round(time.Second))
-	}
 
 	closed := map[int]bool{22: true, 53: true, 80: true, 2019: true}
 	for _, ag := range cfg.Agents {
@@ -225,7 +246,7 @@ func (a *app) checkEdge(ctx context.Context, r *reporter, cfg *config.Config) {
 	list := strings.Trim(strings.Join(strings.Fields(fmt.Sprint(ports)), " "), "[]")
 
 	probe := fmt.Sprintf(`exec -T tunnel sh -c 'for p in %s; do if nc -z -w 3 %s $p >/dev/null 2>&1; then echo "$p open"; else echo "$p closed"; fi; done'`, list, cfg.HomeIP)
-	out, err = c.Compose(ctx, probe)
+	out, err := c.Compose(ctx, probe)
 	if err != nil {
 		r.fail("could not probe the home gateway from the edge")
 		r.detail(err)

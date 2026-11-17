@@ -38,7 +38,9 @@ Commands:
   apply    Re-render after editing hearthgate.yml, preview the diff, update the edge
   push     Copy the edge bundle to the VPS over SSH and start it
   bundle   Write the edge bundle to standard output, to install it with your own ssh
+  status   Show whether both sides are in step and the tunnel is connected
   check    Verify the tunnel, certificates and firewall
+  edge     Start, stop or inspect the edge: edge <up|down|restart|status|logs>
   rotate   Replace the WireGuard keys on both sides
   version  Print the version
 
@@ -78,6 +80,7 @@ func run(ctx context.Context, args []string, in io.Reader, out, errw io.Writer) 
 	fs.StringVar(&a.cfgPath, "config", "", "config file (default <dir>/hearthgate.yml)")
 	yes := false
 	noPush := false
+	var edge edgeOpts
 
 	var cmd func(context.Context) error
 	switch name {
@@ -93,6 +96,14 @@ func run(ctx context.Context, args []string, in io.Reader, out, errw io.Writer) 
 		cmd = a.cmdBundle
 	case "check":
 		cmd = a.cmdCheck
+	case "status":
+		cmd = a.cmdStatus
+	case "edge":
+		fs.Usage = func() { fmt.Fprint(errw, edgeUsage) }
+		fs.BoolVar(&edge.yes, "yes", false, "stop the edge without asking")
+		fs.BoolVar(&edge.follow, "f", false, "keep showing new log lines")
+		fs.IntVar(&edge.tail, "tail", 50, "how many log lines to show")
+		cmd = func(ctx context.Context) error { return a.cmdEdge(ctx, edge) }
 	case "rotate":
 		fs.BoolVar(&yes, "yes", false, "rotate without asking")
 		fs.BoolVar(&noPush, "no-push", false, "do not update the edge over SSH")
@@ -110,7 +121,26 @@ func run(ctx context.Context, args []string, in io.Reader, out, errw io.Writer) 
 		}
 		return 2
 	}
-	if fs.NArg() > 0 {
+	if name == "edge" {
+		// The subcommand comes first, then its flags, then for logs a service.
+		edge.sub = fs.Arg(0)
+		if fs.NArg() > 0 {
+			if err := fs.Parse(fs.Args()[1:]); err != nil {
+				if errors.Is(err, flag.ErrHelp) {
+					return 0
+				}
+				return 2
+			}
+		}
+		edge.service = fs.Arg(0)
+		if err := edge.validate(); err != nil || fs.NArg() > 1 {
+			if err == nil {
+				err = fmt.Errorf("unexpected argument %q", fs.Arg(1))
+			}
+			fmt.Fprintf(errw, "%v\n\n%s", err, edgeUsage)
+			return 2
+		}
+	} else if fs.NArg() > 0 {
 		fmt.Fprintf(errw, "unexpected argument %q\n", fs.Arg(0))
 		return 2
 	}

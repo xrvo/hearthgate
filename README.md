@@ -214,12 +214,30 @@ Run each as `docker compose run --rm ctl <command>`.
 | `push` | Copies the edge bundle over SSH and starts it |
 | `bundle` | Writes the edge bundle to standard output as a `tar.gz`, for installing with your own `ssh` |
 | `apply` | Re-renders after a config change, previews the diff, and pushes the edge if it changed |
+| `status` | Shows whether the generated files, the edge and the tunnel are in step |
+| `edge up` / `down` / `restart` | Starts, stops or restarts the edge stack on the VPS |
+| `edge status` | Shows whether the edge is installed, running, up to date and connected |
+| `edge logs` | Shows the edge's logs; `-f` follows, `-tail N` sets the length, and `tunnel` or `proxy` picks one service |
 | `check` | Tests the certificates, the tunnel handshake, and that home ports other than 443 are closed to the edge |
 | `rotate` | Replaces the WireGuard keys on both sides |
 
 `apply` and `rotate` take `-yes` to skip the prompt and `-no-push` to leave the edge to you.
 
 Each command ends by listing the commands to run next. Output is coloured on a terminal; set `NO_COLOR=1` to turn that off.
+
+## Starting and stopping
+
+Each side is started and stopped from your home server:
+
+| | Home gateway | Edge (on the VPS) |
+|---|---|---|
+| Start | `docker compose up -d` | `docker compose run --rm ctl edge up` |
+| Stop | `docker compose down` | `docker compose run --rm ctl edge down` |
+| Is it working? | `docker compose ps` | `docker compose run --rm ctl status` |
+
+`edge down` asks first, because every published hostname goes offline. It stops the containers and deletes nothing, and the edge stays stopped across VPS reboots until `edge up`. These commands need `edge.ssh`; without it, run `docker compose` in the bundle directory on the VPS.
+
+`status` is the quick look: it compares the files on the edge with the ones generated at home, and reads the tunnel's last handshake. `check` does the same and also tests each certificate and probes the home firewall from the edge.
 
 ## Upgrading
 
