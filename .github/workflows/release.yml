@@ -79,5 +79,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Re-pushing an existing tag replaces its release. The tag itself is
+          # kept (no --cleanup-tag), since this run was triggered by it.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release delete "$GITHUB_REF_NAME" --yes
+          fi
           case "$GITHUB_REF_NAME" in *-*) pre=--prerelease ;; *) pre= ;; esac
           gh release create "$GITHUB_REF_NAME" docker-compose.yml --verify-tag --generate-notes $pre
