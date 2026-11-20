@@ -66,6 +66,8 @@ services:
       - "${HEARTHGATE_SSH_DIR:-${HOME:-.}/.ssh}:/ssh:ro"
       - "${SSH_AUTH_SOCK:-/dev/null}:/ssh-agent"
 
+# Each network hands out addresses to other containers only from its upper
+# half, so an app that starts before the gateway cannot take the gateway's .2.
 networks:
   # Join from the home apps you publish.
   dmz:
@@ -73,12 +75,14 @@ networks:
     ipam:
       config:
         - subnet: "${HEARTHGATE_DMZ_SUBNET:-10.210.1.0/24}"
+          ip_range: "${HEARTHGATE_DMZ_RANGE:-10.210.1.128/25}"
   # Join from home monitoring hubs; they reach edge agents at gateway:<port>.
   mgmt:
     name: hearthgate-mgmt
     ipam:
       config:
         - subnet: "${HEARTHGATE_MGMT_SUBNET:-10.210.2.0/24}"
+          ip_range: "${HEARTHGATE_MGMT_RANGE:-10.210.2.128/25}"
 
 volumes:
   caddy-data:   # certificates and their private keys; these never leave home

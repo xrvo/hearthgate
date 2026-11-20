@@ -184,6 +184,8 @@ In the hub, add a system with host `gateway` and port `45876`. Leave the agent's
 | `networks.mgmt` | `10.210.2.0/24` | Subnet of `hearthgate-mgmt` |
 | `networks.agents` | `10.210.3.0/24` | Subnet of `hearthgate-agents` |
 
+On `hearthgate-dmz` and `hearthgate-mgmt`, the gateway always takes the second address (`.2`), and Docker assigns your containers addresses only from the upper half of the subnet (`10.210.1.128/25` by default). That way an app that starts before the gateway, as can happen after a reboot, cannot take the gateway's address.
+
 Docker cannot change the subnet of a network that containers are attached to. If you change one under `networks`, `ctl apply` tells you what to stop first.
 
 An agent's port is used unchanged on the tunnel and at `gateway:<port>`. Ports 80, 443 and 2019 are taken, and two agents can't share one, so give a different port where needed:
@@ -249,6 +251,8 @@ wget -O docker-compose.yml https://github.com/xrvo/hearthgate/releases/latest/do
 docker compose run --rm ctl apply   # shows what the new release changes, then updates the edge
 docker compose up -d
 ```
+
+If `ctl apply` says a release changes the addresses of `hearthgate-dmz` or `hearthgate-mgmt`, follow the steps it prints before `docker compose up -d`. Docker has to recreate those networks, so the apps and hubs attached to them must be stopped first.
 
 [Updates and maintenance](https://hearthgate.io/docs/guides/maintenance/) also covers rotating keys, backing up, moving to a different VPS and removing Hearthgate.
 

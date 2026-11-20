@@ -152,8 +152,10 @@ func Render(cfg *config.Config, st *state.State, image string) (Files, error) {
 		"HEARTHGATE_CONFIG_HASH=" + files.WithPrefix(HomeDir).Hash(),
 		"HEARTHGATE_DMZ_SUBNET=" + cfg.DMZSubnet.String(),
 		"HEARTHGATE_DMZ_IP=" + cfg.DMZIP.String(),
+		"HEARTHGATE_DMZ_RANGE=" + cfg.DMZRange.String(),
 		"HEARTHGATE_MGMT_SUBNET=" + cfg.MgmtSubnet.String(),
 		"HEARTHGATE_MGMT_IP=" + cfg.MgmtIP.String(),
+		"HEARTHGATE_MGMT_RANGE=" + cfg.MgmtRange.String(),
 		"",
 	}, "\n")
 	files[EnvFile] = File{Content: []byte(env), Mode: 0o644}

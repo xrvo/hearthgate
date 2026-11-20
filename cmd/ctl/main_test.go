@@ -188,7 +188,7 @@ func TestSubnetChangeIsFlagged(t *testing.T) {
 
 	os.WriteFile(filepath.Join(dir, "hearthgate.yml"), []byte(testConfig+"networks: {dmz: 10.99.1.0/24}\n"), 0o644)
 	_, out := ctl(t, dir, "n\n", "apply")
-	if !strings.Contains(out, "changes the subnet of hearthgate-dmz at home") || !strings.Contains(out, "docker compose down") {
+	if !strings.Contains(out, "changes the addresses of hearthgate-dmz at home") || !strings.Contains(out, "docker compose down") {
 		t.Errorf("dmz subnet change not flagged:\n%s", out)
 	}
 	if strings.Contains(out, "hearthgate-mgmt") || strings.Contains(out, "hearthgate-agents on the edge") {
@@ -203,8 +203,35 @@ func TestSubnetChangeIsFlagged(t *testing.T) {
 
 	// An ordinary change carries no such note.
 	os.WriteFile(filepath.Join(dir, "hearthgate.yml"), []byte(strings.Replace(testConfig, "2283", "3000", 1)), 0o644)
-	if _, out := ctl(t, dir, "n\n", "apply"); strings.Contains(out, "subnet") {
+	if _, out := ctl(t, dir, "n\n", "apply"); strings.Contains(out, "subnet") || strings.Contains(out, "addresses of") {
 		t.Errorf("ordinary change flagged:\n%s", out)
+	}
+}
+
+// Installs from before the address ranges existed have networks without one.
+// Adding it means recreating both networks, so the upgrade must say so.
+func TestAddedRangeIsFlagged(t *testing.T) {
+	dir := project(t, testConfig)
+	if _, out := ctl(t, dir, "", "init"); strings.Contains(out, "addresses of") {
+		t.Errorf("first run flagged a network change:\n%s", out)
+	}
+
+	env := filepath.Join(dir, ".env")
+	data, err := os.ReadFile(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var old []string
+	for _, l := range strings.Split(string(data), "\n") {
+		if !strings.Contains(l, "_RANGE=") {
+			old = append(old, l)
+		}
+	}
+	os.WriteFile(env, []byte(strings.Join(old, "\n")), 0o644)
+
+	_, out := ctl(t, dir, "n\n", "apply")
+	if !strings.Contains(out, "changes the addresses of hearthgate-dmz and hearthgate-mgmt at home") {
+		t.Errorf("added ranges not flagged:\n%s", out)
 	}
 }
 

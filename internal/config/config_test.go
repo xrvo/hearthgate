@@ -26,6 +26,9 @@ func TestParseDefaults(t *testing.T) {
 	if c.DMZIP.String() != "10.210.1.2" || c.MgmtIP.String() != "10.210.2.2" {
 		t.Errorf("gateway IPs = %s, %s", c.DMZIP, c.MgmtIP)
 	}
+	if c.DMZRange.String() != "10.210.1.128/25" || c.MgmtRange.String() != "10.210.2.128/25" {
+		t.Errorf("address ranges = %s, %s", c.DMZRange, c.MgmtRange)
+	}
 	if c.TLSCA != CALetsEncrypt || c.HTTPSPort != 443 || c.HTTPPort != 80 || c.EdgeDir != "hearthgate" {
 		t.Errorf("unexpected defaults: %+v", c)
 	}
@@ -112,6 +115,27 @@ func TestParseReportsAllErrors(t *testing.T) {
 	for _, want := range []string{"edge.address", "bad_host", "tls.ca"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error is missing %q:\n%v", want, err)
+		}
+	}
+}
+
+// Docker hands out addresses to other containers only from the range, so the
+// gateway's own address must always sit outside it, for any allowed subnet.
+func TestRangeLeavesGatewayFree(t *testing.T) {
+	for _, tc := range []struct{ subnet, want string }{
+		{"10.99.1.0/24", "10.99.1.128/25"},
+		{"10.99.1.8/29", "10.99.1.12/30"},
+		{"172.20.0.0/16", "172.20.128.0/17"},
+	} {
+		c, err := Parse([]byte(minimal + "networks: {dmz: " + tc.subnet + "}\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := c.DMZRange.String(); got != tc.want {
+			t.Errorf("%s: range = %s, want %s", tc.subnet, got, tc.want)
+		}
+		if !c.DMZSubnet.Contains(c.DMZRange.Addr()) || c.DMZRange.Contains(c.DMZIP) {
+			t.Errorf("%s: range %s must be inside the subnet and leave %s free", tc.subnet, c.DMZRange, c.DMZIP)
 		}
 	}
 }

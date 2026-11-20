@@ -309,6 +309,23 @@ func TestHomeComposeRunsOneImage(t *testing.T) {
 	}
 }
 
+// The compose defaults must match what ctl renders for the default config,
+// or a stack started before the first `ctl apply` would differ from one after.
+func TestHomeComposeRangeDefaults(t *testing.T) {
+	data, err := os.ReadFile("../../docker-compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`ip_range: "${HEARTHGATE_DMZ_RANGE:-10.210.1.128/25}"`,
+		`ip_range: "${HEARTHGATE_MGMT_RANGE:-10.210.2.128/25}"`,
+	} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("docker-compose.yml lacks %s", want)
+		}
+	}
+}
+
 // The example file is what `ctl init` hands new users, so it must always be valid.
 // Compose resolves mounts before ctl starts, so a mount that fails when the
 // user has no ~/.ssh would abort every command, including `init`. Settings

@@ -46,35 +46,42 @@ func placeholders(data []byte) []string {
 	return out
 }
 
-// networkNotes warns about subnet changes. Docker cannot change the subnet of
-// a network in place, and cannot replace one that containers are attached to.
+// networkNotes warns about changes to a network's addressing. Docker cannot
+// change the subnet or address range of a network in place, and cannot
+// replace one that containers are attached to.
 func networkNotes(changes []change) []string {
-	removed := func(c change, marker string) bool {
+	has := func(c change, sign, marker string) bool {
 		for _, l := range c.lines {
-			if strings.HasPrefix(l, "- ") && strings.Contains(l, marker) {
+			if strings.HasPrefix(l, sign+" ") && strings.Contains(l, marker) {
 				return true
 			}
 		}
 		return false
+	}
+	// A range line added next to an unchanged subnet comes from an upgrade
+	// to a release that sets the range; on a first run both are added.
+	changed := func(c change, name string) bool {
+		subnet, rng := "HEARTHGATE_"+name+"_SUBNET=", "HEARTHGATE_"+name+"_RANGE="
+		return has(c, "-", subnet) || has(c, "-", rng) || (has(c, "+", rng) && !has(c, "+", subnet))
 	}
 	var home []string
 	edge := false
 	for _, c := range changes {
 		switch c.path {
 		case render.EnvFile:
-			if removed(c, "HEARTHGATE_DMZ_SUBNET=") {
+			if changed(c, "DMZ") {
 				home = append(home, "hearthgate-dmz")
 			}
-			if removed(c, "HEARTHGATE_MGMT_SUBNET=") {
+			if changed(c, "MGMT") {
 				home = append(home, "hearthgate-mgmt")
 			}
 		case render.EdgeDir + "docker-compose.yml":
-			edge = removed(c, "subnet:")
+			edge = has(c, "-", "subnet:")
 		}
 	}
 	var out []string
 	if len(home) > 0 {
-		out = append(out, fmt.Sprintf(`Note: this changes the subnet of %s at home. Docker cannot replace a network
+		out = append(out, fmt.Sprintf(`Note: this changes the addresses of %s at home. Docker cannot replace a network
 while containers are attached to it, so `+"`docker compose up -d`"+` alone will fail. After applying:
   1. stop the apps and hubs that joined the network
   2. docker compose down && docker compose up -d

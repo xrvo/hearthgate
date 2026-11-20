@@ -7,6 +7,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -79,9 +80,11 @@ type Config struct {
 	HomeIP       netip.Addr // home end of the tunnel
 
 	DMZSubnet    netip.Prefix
-	DMZIP        netip.Addr // gateway address on hearthgate-dmz
+	DMZIP        netip.Addr   // gateway address on hearthgate-dmz
+	DMZRange     netip.Prefix // where Docker picks addresses for other containers on hearthgate-dmz
 	MgmtSubnet   netip.Prefix
-	MgmtIP       netip.Addr // gateway address on hearthgate-mgmt
+	MgmtIP       netip.Addr   // gateway address on hearthgate-mgmt
+	MgmtRange    netip.Prefix // where Docker picks addresses for other containers on hearthgate-mgmt
 	AgentsSubnet netip.Prefix
 }
 
@@ -328,7 +331,20 @@ func Parse(data []byte) (*Config, error) {
 	c.HomeIP = c.EdgeIP.Next()
 	c.DMZIP = c.DMZSubnet.Addr().Next().Next()
 	c.MgmtIP = c.MgmtSubnet.Addr().Next().Next()
+	// Other containers get addresses only from the upper half, so one that
+	// starts first, as after a reboot, cannot take the gateway's .2.
+	c.DMZRange = upperHalf(c.DMZSubnet)
+	c.MgmtRange = upperHalf(c.MgmtSubnet)
 	return c, nil
+}
+
+// upperHalf returns the second half of an IPv4 subnet: 10.0.0.0/24 gives
+// 10.0.0.128/25.
+func upperHalf(p netip.Prefix) netip.Prefix {
+	a := p.Addr().As4()
+	n := binary.BigEndian.Uint32(a[:]) | 1<<(31-p.Bits())
+	binary.BigEndian.PutUint32(a[:], n)
+	return netip.PrefixFrom(netip.AddrFrom4(a), p.Bits()+1)
 }
 
 func orDefault(v, def int) int {
