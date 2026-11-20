@@ -423,11 +423,10 @@ NOSSH="$WORK/nossh"
 mkdir -p "$NOSSH/home"
 cp "$ROOT/docker-compose.yml" "$NOSSH/"
 sed -i "s|ghcr.io/[^ ]*|hearthgate:e2e|" "$NOSSH/docker-compose.yml"
-if (cd "$NOSSH" && HOME="$NOSSH/home" SSH_AUTH_SOCK= docker compose -p hearthgate-e2e-nossh run --rm -T ctl init 2>&1 | grep -q 'Wrote a starting hearthgate.yml'); then
-	pass "ctl init runs for a user with no ~/.ssh and no agent"
-else
-	fail "ctl init runs for a user with no ~/.ssh and no agent"
-fi
+# Capture first: piping into grep -q can cut compose off mid-output, and
+# pipefail then fails the check even though init succeeded.
+nossh_out=$(cd "$NOSSH" && HOME="$NOSSH/home" SSH_AUTH_SOCK= docker compose -p hearthgate-e2e-nossh run --rm -T ctl init 2>&1 || true)
+says "ctl init runs for a user with no ~/.ssh and no agent" "Wrote a starting hearthgate.yml" "$nossh_out"
 
 echo
 echo "$PASS passed, $FAIL failed"
