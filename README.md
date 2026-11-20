@@ -291,7 +291,7 @@ Everything `ctl` writes is in `generated/` and `.env`, plus the starting `hearth
 **What you are trusting:** the Hearthgate image, and through it Caddy, nginx, WireGuard and Alpine. You can check that an image was built by this repository's release workflow from its source:
 
 ```sh
-gh attestation verify oci://ghcr.io/xrvo/hearthgate:0.1.0 --owner xrvo
+gh attestation verify oci://ghcr.io/xrvo/hearthgate:0.1.1 --owner xrvo
 ```
 
 **Out of scope:** vulnerabilities in the apps you publish. Hearthgate keeps them on an isolated network but does not add authentication in front of them.

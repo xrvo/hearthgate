@@ -4,7 +4,7 @@ name: hearthgate
 
 # Every container runs this one image. To upgrade, replace this file with the
 # new release's and run `docker compose run --rm ctl deploy`.
-x-image: &image ghcr.io/xrvo/hearthgate:0.1.0
+x-image: &image ghcr.io/xrvo/hearthgate:0.1.1
 
 services:
   # The WireGuard tunnel and the firewall. The two services below share its
