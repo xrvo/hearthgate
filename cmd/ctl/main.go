@@ -194,30 +194,46 @@ func (a *app) loadConfig() (*config.Config, error) {
 	return cfg, nil
 }
 
-// imageRepo is where releases of the Hearthgate image are published.
-const imageRepo = "ghcr.io/xrvo/hearthgate"
-
 var reImage = regexp.MustCompile(`^[a-z0-9][a-zA-Z0-9._/:@-]{0,254}$`)
 
-// edgeImage is the image the edge stack runs. The home stack's compose file
-// passes its own in HEARTHGATE_IMAGE, so both sides always run the same one.
-func edgeImage() (string, error) {
-	image := os.Getenv("HEARTHGATE_IMAGE")
+// edgeImages are the images the edge stack runs. The home stack's compose
+// file passes its own in HEARTHGATE_WIREGUARD_IMAGE and HEARTHGATE_NGINX_IMAGE,
+// so both sides always run the same versions and docker-compose.yml is the
+// one place they are set.
+func edgeImages() (render.Images, error) {
+	wireguard, err := imageFromEnv("HEARTHGATE_WIREGUARD_IMAGE", "WireGuard")
+	if err != nil {
+		return render.Images{}, err
+	}
+	nginx, err := imageFromEnv("HEARTHGATE_NGINX_IMAGE", "nginx")
+	if err != nil {
+		return render.Images{}, err
+	}
+	return render.Images{WireGuard: wireguard, Nginx: nginx}, nil
+}
+
+func imageFromEnv(name, what string) (string, error) {
+	image := os.Getenv(name)
 	if image == "" {
-		return imageRepo + ":" + version, nil
+		return "", fmt.Errorf("%s is not set, so ctl cannot tell which %s the edge should run.\n"+
+			"Run ctl through the compose file, which sets it: docker compose run --rm ctl <command>", name, what)
 	}
 	if !reImage.MatchString(image) {
-		return "", fmt.Errorf("HEARTHGATE_IMAGE %q is not a valid image reference", image)
+		return "", fmt.Errorf("%s %q is not a valid image reference", name, image)
 	}
 	return image, nil
 }
 
 func (a *app) renderAll(cfg *config.Config, st *state.State) (render.Files, error) {
-	image, err := edgeImage()
+	images, err := edgeImages()
 	if err != nil {
 		return nil, err
 	}
-	return render.Render(cfg, st, image)
+	var owner *render.Owner
+	if uid, gid, ok := fileOwner(a.dir); ok {
+		owner = &render.Owner{UID: uid, GID: gid}
+	}
+	return render.Render(cfg, st, images, owner)
 }
 
 type change struct {

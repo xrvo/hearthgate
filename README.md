@@ -58,7 +58,7 @@ docker compose up -d                 # start the home gateway
 docker compose run --rm ctl deploy   # install the edge on the VPS, wait for the tunnel, verify
 ```
 
-You can also copy [`docker-compose.yml`](docker-compose.yml) from the repository by hand. There is nothing to clone or build: the compose file pulls the published `ghcr.io/xrvo/hearthgate` image.
+You can also copy [`docker-compose.yml`](docker-compose.yml) from the repository by hand. There is nothing to clone or build: the compose file pulls `linuxserver/wireguard`, the official Caddy and nginx images, and the published `ghcr.io/xrvo/hearthgate` image for `ctl`.
 
 `init` asks for the VPS's address, the SSH user to reach it as, a first hostname to publish and the home container it should reach. It writes them to `hearthgate.yml`:
 
@@ -80,7 +80,7 @@ docker compose run --rm ctl deploy   # shows a diff, asks, then updates the edge
 docker compose up -d                 # picks up the change at home
 ```
 
-If `docker compose up -d` reports that the gateway did not start, `docker compose logs gateway` says why in plain words: most often the configuration has not been generated yet (run `init`), or the kernel has no WireGuard support. Where there is no terminal to ask on, `init` writes an example `hearthgate.yml` for you to edit, and a second `init` generates from it.
+If `docker compose up -d` reports that the gateway is unhealthy, `docker compose logs gateway` shows what WireGuard's container saw. Most often the configuration has not been generated yet (the log says `No valid tunnel config found`; run `init`, then `docker compose up -d` again), or the kernel has no WireGuard support (`ip link add dev wg0 type wireguard` fails). If the log says permissions could not be set, the generated files belong to a different user than the gateway runs as, for example after running `ctl` with `sudo`; it is harmless, and `docker compose run --rm ctl apply` followed by `docker compose up -d` lines them up again. Where there is no terminal to ask on, `init` writes an example `hearthgate.yml` for you to edit, and a second `init` generates from it.
 
 `ctl` reaches the VPS as `edge.ssh`. It signs in with your SSH agent, or with `id_ed25519`, `id_ecdsa` or `id_rsa` from `~/.ssh`. It does not read `~/.ssh/config`. If your keys live elsewhere, set `HEARTHGATE_SSH_DIR` to that directory.
 
@@ -94,8 +94,10 @@ If you leave out `edge.ssh`, or your connection needs `~/.ssh/config`, a jump ho
 
 ```sh
 docker compose run --rm -T ctl bundle | ssh ubuntu@203.0.113.5 \
-  'mkdir -p hearthgate && cd hearthgate && tar -xzf - && docker compose up -d --remove-orphans'
+  'mkdir -p hearthgate && cd hearthgate && tar -xzf - && { echo HEARTHGATE_PUID=$(id -u); echo HEARTHGATE_PGID=$(id -g); } > .env && docker compose up -d --remove-orphans'
 ```
+
+The `.env` part records your SSH user's IDs, so the WireGuard container runs as the owner of its files.
 
 `ctl` prints this command, filled in for your configuration, whenever the edge needs installing by hand. Repeat it whenever `ctl apply` says the edge bundle changed. The `-T` matters: without it the archive would pass through a terminal and arrive corrupted, so `ctl bundle` stops and tells you.
 
@@ -252,6 +254,14 @@ docker compose run --rm ctl apply   # shows what the new release changes, then u
 docker compose up -d
 ```
 
+Between releases, rebuilds of the WireGuard, Caddy and nginx images (bug and security fixes) arrive when you pull. At home:
+
+```sh
+docker compose pull && docker compose up -d
+```
+
+On the edge, run the same two commands in the edge directory on the VPS (`~/hearthgate` unless you set `edge.dir`).
+
 If `ctl apply` says a release changes the addresses of `hearthgate-dmz` or `hearthgate-mgmt`, follow the steps it prints before `docker compose up -d`. Docker has to recreate those networks, so the apps and hubs attached to them must be stopped first.
 
 [Updates and maintenance](https://hearthgate.io/docs/guides/maintenance/) also covers rotating keys, backing up, moving to a different VPS and removing Hearthgate.
@@ -266,8 +276,8 @@ Each side runs a tunnel container, holding the WireGuard interface and the firew
 - **Firewall:** generated, default-deny, input rules only. IP forwarding is disabled in both tunnel namespaces, and neither side uses NAT.
 - **Keys:** both WireGuard key pairs are generated at home. The edge's key reaches it inside the pushed bundle.
 - **Separation:** every container gets a directory holding only its own files, mounted read-only. Only the tunnel container has the WireGuard keys and the `NET_ADMIN` capability. Caddy and nginx share its network, but can neither read the keys nor change the firewall, and the firewall is loaded before the tunnel interface comes up.
-- **Image:** one image, `ghcr.io/xrvo/hearthgate`, runs every container on both sides. This repository builds it and publishes it with a build provenance attestation. It packages Caddy and nginx from their official images, pinned by digest in the [`Dockerfile`](Dockerfile), with WireGuard's `wg`, `iptables` and OpenSSH from Alpine's package repository. Alpine packages are installed when the image is built and are not pinned individually.
-- **Own code:** `ctl`, a Go program that runs one-shot and never listens on the network, and a short [shell entrypoint](image/hearthgate) that brings up the tunnel and firewall and starts each proxy.
+- **Images:** the stacks run ready-made images only. The tunnel runs [linuxserver/wireguard](https://github.com/linuxserver/docker-wireguard), which brings up the generated `wg0.conf` with `wg-quick` and loads the firewall in its `PreUp` hook; the tunnel itself is the kernel's built-in WireGuard. Caddy and nginx run from their official images. Each is pinned by version tag, never by digest: the current wireguard-tools release, Caddy's current minor release and nginx's stable branch, so rebuilds with bug and security fixes arrive without breaking changes. [`docker-compose.yml`](docker-compose.yml) names them, and `ctl` gives the edge the same WireGuard and nginx images.
+- **Own code:** `ctl`, a Go program that runs one-shot and never listens on the network. This repository builds its image, `ghcr.io/xrvo/hearthgate`, on Alpine and publishes it with a build provenance attestation.
 
 Everything `ctl` writes is in `generated/` and `.env`, plus the starting `hearthgate.yml`. Keep `generated/state.json` private and backed up: it holds the tunnel keys. That file and `hearthgate.yml` are enough to rebuild everything else: put them beside `docker-compose.yml` on a new home server and run `ctl apply`.
 
@@ -288,7 +298,7 @@ Everything `ctl` writes is in `generated/` and `.env`, plus the starting `hearth
 - Reach any other port, container or host on your home network
 - Change what is published or reachable
 
-**What you are trusting:** the Hearthgate image, and through it Caddy, nginx, WireGuard and Alpine. You can check that an image was built by this repository's release workflow from its source:
+**What you are trusting:** the images the stacks run, and their publishers: linuxserver.io for `linuxserver/wireguard`, and the official Caddy and nginx images; your kernel's WireGuard; and the Hearthgate image, which runs `ctl` at home and holds your SSH access to the edge. You can check that a Hearthgate image was built by this repository's release workflow from its source:
 
 ```sh
 gh attestation verify oci://ghcr.io/xrvo/hearthgate:0.1.1 --owner xrvo

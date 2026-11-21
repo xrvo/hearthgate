@@ -24,8 +24,14 @@ jobs:
       - name: Test
         run: go test ./...
 
+  # Both architectures a release publishes, each on a native runner: WireGuard
+  # cannot be configured under emulation.
   e2e:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
       - name: Load WireGuard

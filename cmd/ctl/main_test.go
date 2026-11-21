@@ -28,6 +28,42 @@ agents:
   beszel: beszel-agent:45876
 `
 
+// testWireGuard and testNginx stand in for the images docker-compose.yml
+// passes to ctl.
+const (
+	testWireGuard = "linuxserver/wireguard:9.9.99999999"
+	testNginx     = "nginx:9.98-alpine"
+)
+
+func TestMain(m *testing.M) {
+	// The home compose file sets these for every ctl run.
+	os.Setenv("HEARTHGATE_WIREGUARD_IMAGE", testWireGuard)
+	os.Setenv("HEARTHGATE_NGINX_IMAGE", testNginx)
+	os.Exit(m.Run())
+}
+
+// The edge runs the images that the home compose file names; without them ctl
+// stops and says how to run it, rather than guessing a version.
+func TestEdgeImagesComeFromCompose(t *testing.T) {
+	images, err := edgeImages()
+	if err != nil || images.WireGuard != testWireGuard || images.Nginx != testNginx {
+		t.Fatalf("edgeImages() = %+v, %v", images, err)
+	}
+	for _, name := range []string{"HEARTHGATE_WIREGUARD_IMAGE", "HEARTHGATE_NGINX_IMAGE"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(name, "nginx:1.30 ; rm -rf /")
+			if _, err := edgeImages(); err == nil {
+				t.Error("an invalid image reference was accepted")
+			}
+			t.Setenv(name, "")
+			_, err := edgeImages()
+			if err == nil || !strings.Contains(err.Error(), name) || !strings.Contains(err.Error(), "docker compose run --rm ctl") {
+				t.Errorf("a missing image should be named, with how to run ctl through compose; got %v", err)
+			}
+		})
+	}
+}
+
 func ctl(t *testing.T, dir, stdin string, args ...string) (int, string) {
 	t.Helper()
 	var out bytes.Buffer
@@ -63,9 +99,9 @@ func TestInitThenApply(t *testing.T) {
 	for _, f := range []string{
 		"generated/state.json", ".env",
 		"generated/home/caddy/Caddyfile", "generated/home/stream/nginx.conf",
-		"generated/home/tunnel/wg0.conf", "generated/home/tunnel/firewall.sh", "generated/home/tunnel/tunnel.env",
+		"generated/home/tunnel/wg0.conf", "generated/home/tunnel/firewall.sh",
 		"generated/edge/docker-compose.yml", "generated/edge/proxy/nginx.conf",
-		"generated/edge/tunnel/wg0.conf", "generated/edge/tunnel/firewall.sh", "generated/edge/tunnel/tunnel.env",
+		"generated/edge/tunnel/wg0.conf", "generated/edge/tunnel/firewall.sh",
 	} {
 		read(t, dir, f)
 	}
@@ -366,13 +402,13 @@ func TestBundle(t *testing.T) {
 		body, _ := io.ReadAll(tr)
 		got[hdr.Name] = string(body)
 	}
-	for _, f := range []string{"docker-compose.yml", "proxy/nginx.conf", "tunnel/firewall.sh", "tunnel/wg0.conf", "tunnel/tunnel.env"} {
+	for _, f := range []string{"docker-compose.yml", "proxy/nginx.conf", "tunnel/firewall.sh", "tunnel/wg0.conf"} {
 		if got[f] != read(t, dir, "generated/edge/"+f) {
 			t.Errorf("bundle entry %s differs from generated/edge/%s", f, f)
 		}
 	}
-	if len(got) != 5 {
-		t.Errorf("bundle has %d entries, want 5", len(got))
+	if len(got) != 4 {
+		t.Errorf("bundle has %d entries, want 4", len(got))
 	}
 
 	// A stale bundle must not be handed out.
@@ -401,7 +437,7 @@ func TestBundleRefusesTerminal(t *testing.T) {
 func TestManualInstallCommand(t *testing.T) {
 	dir := project(t, strings.Replace(testConfig, "address: 198.51.100.7", "address: 198.51.100.7\n  ssh_port: 2222", 1))
 	_, out := ctl(t, dir, "", "push")
-	want := "docker compose run --rm -T ctl bundle | ssh -p 2222 <user>@198.51.100.7 'mkdir -p hearthgate && cd hearthgate && tar -xzf - && docker compose up -d --remove-orphans'"
+	want := "docker compose run --rm -T ctl bundle | ssh -p 2222 <user>@198.51.100.7 'mkdir -p hearthgate && cd hearthgate && tar -xzf - && { echo HEARTHGATE_PUID=$(id -u); echo HEARTHGATE_PGID=$(id -g); } > .env && docker compose up -d --remove-orphans'"
 	if !strings.Contains(out, want) || strings.Count(out, "'") != 2 {
 		t.Errorf("manual install command is wrong or not safely quoted:\n%s", out)
 	}

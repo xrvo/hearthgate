@@ -4,26 +4,37 @@ name: hearthgate-edge
 services:
   # The WireGuard tunnel and the firewall.
   tunnel:
-    image: {{.Image}}
-    command: tunnel
+    image: {{.WireGuard}}
     cap_add: [NET_ADMIN]
     sysctls:
       net.ipv4.ip_forward: "0"
+    environment:
+      # Run as the owner of these files, which the install writes to .env, so
+      # the image finds nothing to take ownership of on its read-only mount.
+      PUID: "${HEARTHGATE_PUID:-1000}"
+      PGID: "${HEARTHGATE_PGID:-1000}"
     labels:
       io.hearthgate.config-hash: "{{.EdgeHash}}"
     volumes:
-      - ./tunnel:/etc/hearthgate:ro
+      - ./tunnel:/config/wg_confs:ro
     ports:
       - "{{.WireGuardPort}}:51820/udp"
       - "{{.HTTPSPort}}:443"
       - "{{.HTTPPort}}:80"
     networks: [public, agents]
+    healthcheck:
+      # Healthy once the tunnel is up and the default-deny firewall is loaded.
+      test: ["CMD-SHELL", "ip -o link show wg0 2>/dev/null | grep -q '[<,]UP[,>]' && iptables -S INPUT 2>/dev/null | grep -q -- '-P INPUT DROP'"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
 
   # TCP passthrough to home; shares the tunnel's network, not its keys.
   proxy:
-    image: {{.Image}}
-    command: nginx
+    image: {{.Nginx}}
+    command: ["nginx", "-c", "/etc/hearthgate/nginx.conf", "-g", "daemon off;"]
     network_mode: "service:tunnel"
     depends_on:
       tunnel:

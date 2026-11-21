@@ -194,8 +194,12 @@ func (c *Client) Push(ctx context.Context, bundle render.Files, onLine func(stri
 	return err
 }
 
+// unpackScript unpacks the bundle into dir and records in .env who owns the
+// files, for the edge compose file: the WireGuard container runs as them, so
+// it finds nothing to take ownership of on its read-only mount. As root, tar
+// keeps the archive's owner, which is root too.
 func unpackScript(dir string) string {
-	return fmt.Sprintf("mkdir -p %[1]s && cd %[1]s && tar -xzf -", dir)
+	return fmt.Sprintf("mkdir -p %[1]s && cd %[1]s && tar -xzf - && { echo HEARTHGATE_PUID=$(id -u); echo HEARTHGATE_PGID=$(id -g); } > .env", dir)
 }
 
 const startScript = "docker compose up -d --remove-orphans"

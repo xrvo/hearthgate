@@ -109,7 +109,7 @@ func TestLineWriter(t *testing.T) {
 }
 
 func TestInstallScriptQuoting(t *testing.T) {
-	if s := InstallScript("hearthgate"); strings.Contains(s, "'") || s != "mkdir -p hearthgate && cd hearthgate && tar -xzf - && docker compose up -d --remove-orphans" {
+	if s := InstallScript("hearthgate"); strings.Contains(s, "'") || s != "mkdir -p hearthgate && cd hearthgate && tar -xzf - && { echo HEARTHGATE_PUID=$(id -u); echo HEARTHGATE_PGID=$(id -g); } > .env && docker compose up -d --remove-orphans" {
 		t.Errorf("install script = %q", s)
 	}
 }

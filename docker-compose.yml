@@ -2,34 +2,54 @@
 # `docker compose run --rm ctl init`.
 name: hearthgate
 
-# Every container runs this one image. To upgrade, replace this file with the
-# new release's and run `docker compose run --rm ctl deploy`.
+# The images every container runs, set here and nowhere else: ctl gives the
+# edge the same ones. To upgrade, replace this file with the new release's and
+# run `docker compose run --rm ctl apply`.
+#
+# The Hearthgate image runs only ctl.
 x-image: &image ghcr.io/xrvo/hearthgate:0.1.1
+# The stacks run ready-made images, pinned by version tag so that rebuilds
+# with bug and security fixes arrive on `docker compose pull`: linuxserver's
+# WireGuard image for the current wireguard-tools release, Caddy's current
+# minor release, and nginx's stable branch (an even minor).
+x-wireguard: &wireguard linuxserver/wireguard:1.0.20260223
+x-caddy: &caddy caddy:2.11-alpine
+x-nginx: &nginx nginx:1.30-alpine
 
 services:
   # The WireGuard tunnel and the firewall. The two services below share its
   # network, but not its privileges or its keys.
   gateway:
-    image: *image
-    command: tunnel
+    image: *wireguard
     cap_add: [NET_ADMIN]            # to create the tunnel and firewall inside this container
     sysctls:
       net.ipv4.ip_forward: "0"      # nothing is routed between the tunnel and your networks
     environment:
       HEARTHGATE_CONFIG_HASH: "${HEARTHGATE_CONFIG_HASH:-}"   # restarts the stack when the configuration changes
+      # Run as the owner of the generated files, which ctl writes to .env, so
+      # the image finds nothing to take ownership of on its read-only mount.
+      PUID: "${HEARTHGATE_PUID:-1000}"
+      PGID: "${HEARTHGATE_PGID:-1000}"
     volumes:
-      - ./generated/home/tunnel:/etc/hearthgate:ro
+      - ./generated/home/tunnel:/config/wg_confs:ro   # wg-quick brings up wg0.conf from here
     networks:
       dmz:
         ipv4_address: "${HEARTHGATE_DMZ_IP:-10.210.1.2}"
       mgmt:
         ipv4_address: "${HEARTHGATE_MGMT_IP:-10.210.2.2}"
+    healthcheck:
+      # Healthy once the tunnel is up and the default-deny firewall is loaded.
+      test: ["CMD-SHELL", "ip -o link show wg0 2>/dev/null | grep -q '[<,]UP[,>]' && iptables -S INPUT 2>/dev/null | grep -q -- '-P INPUT DROP'"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
     restart: unless-stopped
 
   # TLS and HTTP routing to the apps you publish.
   caddy:
-    image: *image
-    command: caddy
+    image: *caddy
+    command: ["caddy", "run", "--config", "/etc/hearthgate/Caddyfile", "--adapter", "caddyfile"]
     network_mode: "service:gateway"
     depends_on: &after-gateway
       gateway:
@@ -42,8 +62,8 @@ services:
 
   # Connections from your monitoring hubs to agents on the edge.
   stream:
-    image: *image
-    command: nginx
+    image: *nginx
+    command: ["nginx", "-c", "/etc/hearthgate/nginx.conf", "-g", "daemon off;"]
     network_mode: "service:gateway"
     depends_on: *after-gateway
     volumes:
@@ -56,7 +76,9 @@ services:
     image: *image
     network_mode: bridge
     environment:
-      HEARTHGATE_IMAGE: *image      # the edge runs the same image
+      # The edge runs the same images.
+      HEARTHGATE_WIREGUARD_IMAGE: *wireguard
+      HEARTHGATE_NGINX_IMAGE: *nginx
       SSH_AUTH_SOCK: /ssh-agent
       HEARTHGATE_SSH_DIR_HOST: "${HEARTHGATE_SSH_DIR:-${HOME:-.}/.ssh}"
       NO_COLOR: "${NO_COLOR:-}"

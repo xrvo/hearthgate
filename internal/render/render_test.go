@@ -3,6 +3,7 @@ package render
 import (
 	"bytes"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -11,7 +12,7 @@ import (
 	"github.com/xrvo/hearthgate/internal/state"
 )
 
-const testImage = "ghcr.io/xrvo/hearthgate:9.9.9"
+var testImages = Images{WireGuard: "linuxserver/wireguard:9.9.99999999", Nginx: "nginx:9.98-alpine"}
 
 const sample = `
 edge:
@@ -34,7 +35,7 @@ func mustRender(t *testing.T, yaml string) (Files, *state.State) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	files, err := Render(cfg, st, testImage)
+	files, err := Render(cfg, st, testImages, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,11 +63,11 @@ func wantAll(t *testing.T, name, got string, wants ...string) {
 func TestRenderIsDeterministic(t *testing.T) {
 	cfg, _ := config.Parse([]byte(sample))
 	st, _ := state.New()
-	a, err := Render(cfg, st, testImage)
+	a, err := Render(cfg, st, testImages, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, _ := Render(cfg, st, testImage)
+	b, _ := Render(cfg, st, testImages, nil)
 	for _, p := range a.Paths() {
 		if !bytes.Equal(a[p].Content, b[p].Content) {
 			t.Errorf("%s differs between two renders", p)
@@ -95,19 +96,19 @@ func TestWireGuardConfs(t *testing.T) {
 		t.Error("edge wg0.conf has an Endpoint; home must be the side that dials")
 	}
 
-	// `wg setconf` rejects the keys only wg-quick understands.
+	wantAll(t, "home wg0.conf", home, "Address = 10.210.0.2/32")
+	wantAll(t, "edge wg0.conf", edge, "Address = 10.210.0.1/32")
+
+	// wg-quick in linuxserver/wireguard brings these up. The firewall must be
+	// loaded in PreUp, before the interface comes up, never in PostUp; and
+	// nothing may route more than the peer's own address or change DNS.
 	for _, conf := range []string{home, edge} {
-		for _, bad := range []string{"Address", "PostUp", "DNS", "MTU"} {
+		wantAll(t, "wg0.conf", conf, "MTU = 1420", "PreUp = sh /config/wg_confs/firewall.sh %i")
+		for _, bad := range []string{"PostUp", "DNS", "0.0.0.0/0", "SaveConfig"} {
 			if strings.Contains(conf, bad) {
-				t.Errorf("wg0.conf has %q, which `wg setconf` does not accept:\n%s", bad, conf)
+				t.Errorf("wg0.conf has %q:\n%s", bad, conf)
 			}
 		}
-	}
-	if got := content(t, files, HomeDir+"tunnel/tunnel.env"); got != "ADDRESS=10.210.0.2\nPEER=10.210.0.1\n" {
-		t.Errorf("home tunnel.env = %q", got)
-	}
-	if got := content(t, files, EdgeDir+"tunnel/tunnel.env"); got != "ADDRESS=10.210.0.1\nPEER=10.210.0.2\n" {
-		t.Errorf("edge tunnel.env = %q", got)
 	}
 
 	for _, p := range []string{HomeDir + "tunnel/wg0.conf", EdgeDir + "tunnel/wg0.conf"} {
@@ -231,7 +232,7 @@ func TestCustomPorts(t *testing.T) {
 	files, _ := mustRender(t, "edge: {address: vps.example.net, https_port: 8443, http_port: 8080, wireguard_port: 51900}\npublish: {a.example.com: app:80}\n")
 	wantAll(t, "edge nginx.conf", content(t, files, EdgeDir+"proxy/nginx.conf"), "return 301 https://$host:8443$request_uri;")
 	wantAll(t, "edge compose", content(t, files, EdgeDir+"docker-compose.yml"),
-		`"51900:51820/udp"`, `"8443:443"`, `"8080:80"`, "image: "+testImage, "name: hearthgate-agents")
+		`"51900:51820/udp"`, `"8443:443"`, `"8080:80"`, "image: "+testImages.WireGuard, "image: "+testImages.Nginx, "name: hearthgate-agents")
 	wantAll(t, "home wg0.conf", content(t, files, HomeDir+"tunnel/wg0.conf"), "Endpoint = vps.example.net:51900")
 }
 
@@ -248,8 +249,8 @@ func TestHashesTrackContent(t *testing.T) {
 	cfgA, _ := config.Parse([]byte(sample))
 	cfgB, _ := config.Parse([]byte(strings.Replace(sample, "paperless:8000", "paperless:8001", 1)))
 	st, _ := state.New()
-	a, _ := Render(cfgA, st, testImage)
-	b, _ := Render(cfgB, st, testImage)
+	a, _ := Render(cfgA, st, testImages, nil)
+	b, _ := Render(cfgB, st, testImages, nil)
 
 	if envHash(a) == envHash(b) {
 		t.Error("home hash did not change when a published target changed")
@@ -273,9 +274,9 @@ func TestEachContainerGetsItsOwnDirectory(t *testing.T) {
 		}
 	}
 	edge := content(t, files, EdgeDir+"docker-compose.yml")
-	wantAll(t, "edge compose", edge, "- ./tunnel:/etc/hearthgate:ro", "- ./proxy:/etc/hearthgate:ro")
-	if strings.Count(edge, "NET_ADMIN") != 1 || strings.Count(edge, "image: "+testImage) != 2 {
-		t.Errorf("edge compose should run one image twice and grant NET_ADMIN once:\n%s", edge)
+	wantAll(t, "edge compose", edge, "- ./tunnel:/config/wg_confs:ro", "- ./proxy:/etc/hearthgate:ro")
+	if strings.Count(edge, "NET_ADMIN") != 1 || strings.Count(edge, "image: "+testImages.WireGuard) != 1 || strings.Count(edge, "image: "+testImages.Nginx) != 1 {
+		t.Errorf("edge compose should run the tunnel on linuxserver/wireguard, the proxy on nginx, and grant NET_ADMIN once:\n%s", edge)
 	}
 
 	data, err := os.ReadFile("../../docker-compose.yml")
@@ -284,28 +285,108 @@ func TestEachContainerGetsItsOwnDirectory(t *testing.T) {
 	}
 	home := string(data)
 	wantAll(t, "home compose", home,
-		"- ./generated/home/tunnel:/etc/hearthgate:ro", "- ./generated/home/caddy:/etc/hearthgate:ro", "- ./generated/home/stream:/etc/hearthgate:ro")
+		"- ./generated/home/tunnel:/config/wg_confs:ro", "- ./generated/home/caddy:/etc/hearthgate:ro", "- ./generated/home/stream:/etc/hearthgate:ro")
 	if strings.Count(home, "NET_ADMIN") != 1 {
 		t.Errorf("home compose should grant NET_ADMIN to the gateway only:\n%s", home)
 	}
 }
 
 // Users copy the home compose file on its own, so it must run without a
-// source checkout, and from one image: upstream pins live in the Dockerfile.
-func TestHomeComposeRunsOneImage(t *testing.T) {
+// source checkout. It names each image once, behind an anchor, and passes
+// the WireGuard and nginx images to ctl so the edge runs the same versions.
+func TestHomeComposeImages(t *testing.T) {
 	data, err := os.ReadFile("../../docker-compose.yml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	compose := string(data)
 	if n := strings.Count(compose, "ghcr.io/"); n != 1 {
-		t.Errorf("docker-compose.yml names %d images; want the one behind the &image anchor", n)
+		t.Errorf("docker-compose.yml names the Hearthgate image %d times; want once, behind the &image anchor, for ctl", n)
 	}
-	if strings.Count(compose, "image: *image\n") != 4 || strings.Contains(compose, "sha256:") {
-		t.Errorf("every service should use the &image anchor, with no pins of its own")
+	for _, want := range []struct {
+		snippet string
+		n       int
+	}{
+		{"image: *image\n", 1},     // ctl
+		{"image: *wireguard\n", 1}, // gateway
+		{"image: *caddy\n", 1},     // caddy
+		{"image: *nginx\n", 1},     // stream
+		{"HEARTHGATE_WIREGUARD_IMAGE: *wireguard", 1},
+		{"HEARTHGATE_NGINX_IMAGE: *nginx", 1},
+	} {
+		if n := strings.Count(compose, want.snippet); n != want.n {
+			t.Errorf("docker-compose.yml has %q %d times; want %d", want.snippet, n, want.n)
+		}
 	}
 	if strings.Contains(compose, "build:") {
 		t.Error("docker-compose.yml needs a source checkout to build")
+	}
+}
+
+// Upstream images are pinned by version tag, at the level where upstream ships
+// only fixes, and never by digest: see "Upstream versions" in CONTRIBUTING.md.
+func TestUpstreamImagesPinnedByVersionTag(t *testing.T) {
+	compose, err := os.ReadFile("../../docker-compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dockerfile, err := os.ReadFile("../../Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, text := range map[string]string{"docker-compose.yml": string(compose), "Dockerfile": string(dockerfile)} {
+		if strings.Contains(text, "sha256:") {
+			t.Errorf("%s pins an image by digest", name)
+		}
+	}
+	for _, want := range []struct{ file, text, pattern, why string }{
+		{"docker-compose.yml", string(compose), `(?m)^x-wireguard: &wireguard linuxserver/wireguard:1\.0\.\d{8}$`, "a wireguard-tools release, e.g. linuxserver/wireguard:1.0.20260223, which follows linuxserver's rebuilds"},
+		{"docker-compose.yml", string(compose), `(?m)^x-nginx: &nginx nginx:1\.\d*[02468]-alpine$`, "nginx's stable branch (an even minor), e.g. nginx:1.30-alpine"},
+		{"docker-compose.yml", string(compose), `(?m)^x-caddy: &caddy caddy:2\.\d+-alpine$`, "a Caddy minor release, e.g. caddy:2.11-alpine"},
+		{"Dockerfile", string(dockerfile), `(?m)^FROM alpine:3\.\d+$`, "an Alpine branch, e.g. alpine:3.24"},
+		{"Dockerfile", string(dockerfile), `(?m)^FROM --platform=\$BUILDPLATFORM golang:1\.\d+-alpine AS build$`, "a Go minor release, e.g. golang:1.27-alpine"},
+	} {
+		if !regexp.MustCompile(want.pattern).MatchString(want.text) {
+			t.Errorf("%s should pin %s", want.file, want.why)
+		}
+	}
+}
+
+// The WireGuard containers run as the owner of their read-only files, so
+// linuxserver's start-up has nothing to chown: home from .env, which ctl
+// writes, and the edge from the .env its install script writes.
+func TestWireGuardRunsAsFileOwner(t *testing.T) {
+	cfg, err := config.Parse([]byte(sample))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := state.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := Render(cfg, st, testImages, &Owner{UID: 1001, GID: 1002})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAll(t, ".env", content(t, files, EnvFile), "\nHEARTHGATE_PUID=1001\n", "\nHEARTHGATE_PGID=1002\n")
+	unknown, err := Render(cfg, st, testImages, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(content(t, unknown, EnvFile), "PUID") {
+		t.Error(".env names an owner although none is known")
+	}
+	if files.WithPrefix(HomeDir).Hash() != unknown.WithPrefix(HomeDir).Hash() {
+		t.Error("the owner changed a mounted file; it belongs in .env only")
+	}
+
+	data, err := os.ReadFile("../../docker-compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	edge := content(t, files, EdgeDir+"docker-compose.yml")
+	for name, compose := range map[string]string{"home compose": string(data), "edge compose": edge} {
+		wantAll(t, name, compose, `PUID: "${HEARTHGATE_PUID:-1000}"`, `PGID: "${HEARTHGATE_PGID:-1000}"`)
 	}
 }
 

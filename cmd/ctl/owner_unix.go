@@ -23,6 +23,16 @@ func dirOwner(dir string) (uid, gid int, ok bool) {
 	return int(st.Uid), int(st.Gid), true
 }
 
+// fileOwner returns the user and group that end up owning the files ctl
+// writes: the project owner when ctl runs as root and hands them back (see
+// write), and otherwise ctl itself.
+func fileOwner(dir string) (uid, gid int, ok bool) {
+	if uid, gid, ok := dirOwner(dir); ok && uid != 0 && os.Geteuid() == 0 {
+		return uid, gid, true
+	}
+	return os.Geteuid(), os.Getegid(), true
+}
+
 // chownTree hands generated files back to the project owner. Failures are
 // ignored: ownership is a convenience, not something the stacks depend on.
 func chownTree(root string, uid, gid int) {
